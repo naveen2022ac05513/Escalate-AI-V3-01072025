@@ -1,6 +1,7 @@
 streamlit
 pandas
 openpyxl
+xlsxwriter
 python-dotenv
 transformers
 scikit-learn
