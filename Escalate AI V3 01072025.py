@@ -191,10 +191,8 @@ def boss_check():
                         upd=r.to_dict(); upd["spoc_notify_count"]+=1; upsert_case(upd)
     except Exception as e:
         st.warning(f"Scheduler error: {e}")
-
 if "sched" not in st.session_state:
     sc=BackgroundScheduler(); sc.add
-
 # ========== Sidebar Upload & Manual Entry ==========
 with st.sidebar:
     st.header("📥 Upload Escalations")
