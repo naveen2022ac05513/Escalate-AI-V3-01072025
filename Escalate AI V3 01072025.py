@@ -1,238 +1,199 @@
 # ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v1.0.1)
+# EscalateAI – End‑to‑End Escalation Management System (v1.1.1)
 # --------------------------------------------------------------
-# • Full-featured single-file Streamlit app with notifications
+# • Full single‑file Streamlit app
+# • SQLite persistence & auto‑schema upgrade
+# • Sentiment (HF or rule‑based) + risk ML model
+# • Sidebar: Excel/CSV upload  & manual entry
+# • Kanban board with inline edits & notifications
+# • Notification History viewer
+# • Robust SMTP email with retries
+# • Scheduler escalates to boss after 2 SPOC emails & 24 h
 # --------------------------------------------------------------
-# Author: Naveen Gandham • July 2025
+# Author: Naveen Gandham • July 2025
 # ==============================================================
 
-import os
-import re
-import sqlite3
-import warnings
-import atexit
-import smtplib
+"""Quick‑start:
+
+pip install streamlit pandas openpyxl python-dotenv transformers scikit-learn joblib requests apscheduler
+# (Optional) better accuracy – only if PyTorch wheel available:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# .env (same folder)
+SMTP_SERVER=smtp.mail.yahoo.com
+SMTP_PORT=587
+SMTP_USER=naveengandham@yahoo.co.in
+SMTP_PASS=<YAHOO_APP_PASSWORD>
+SLACK_WEBHOOK_URL=
+
+streamlit run escalateai_app.py
+"""
+
+import os, re, sqlite3, atexit, smtplib, time
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Tuple
 
-import joblib
-import pandas as pd
-import requests
-import streamlit as st
+import joblib, pandas as pd, streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
-# Paths & ENV
-APP_DIR = Path(__file__).resolve().parent
-MODEL_DIR = APP_DIR / "models"
-MODEL_DIR.mkdir(exist_ok=True)
-DATA_DIR = APP_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "escalateai.db"
+# ========== Paths & ENV ==========
+APP_DIR   = Path(__file__).resolve().parent
+MODEL_DIR = APP_DIR / "models" ; MODEL_DIR.mkdir(exist_ok=True)
+DATA_DIR  = APP_DIR / "data"  ; DATA_DIR.mkdir(exist_ok=True)
+DB_PATH   = DATA_DIR / "escalateai.db"
 
 load_dotenv()
 SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_PORT   = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER   = os.getenv("SMTP_USER")
+SMTP_PASS   = os.getenv("SMTP_PASS")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-ALERT_CHANNEL_ENABLED = bool(SLACK_WEBHOOK_URL)
 
-# Sentiment setup (HF model or rule-based fallback)
+# ========== Sentiment ==========
 try:
-    from transformers import pipeline as hf_pipeline
-
-    HAS_HF = True
-except ModuleNotFoundError:
-    HAS_HF = False
-
-try:
-    import torch
-
-    HAS_TORCH = True
-except ModuleNotFoundError:
-    HAS_TORCH = False
-
+    from transformers import pipeline as hf_pipeline; import torch ; HAS_NLP=True
+except Exception:
+    HAS_NLP=False
 
 @st.cache_resource(show_spinner=False)
-def load_sentiment_model():
-    if not (HAS_HF and HAS_TORCH):
-        return None
+def load_sentiment():
+    if not HAS_NLP: return None
     try:
-        return hf_pipeline(
-            "sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment"
-        )
+        return hf_pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment")
     except Exception:
         return None
 
+sent_model = load_sentiment()
+negative_words = [
+    r"\b(problematic|delay|issue|failure|dissatisfaction|frustration|unacceptable|mistake|complaint|unresolved|unresponsive|unstable|broken|defective|overdue|escalation|leakage|damage|burnt|critical|risk|dispute|faulty)\b"
+]
+NEG_WORDS = negative_words
 
-sentiment_model = load_sentiment_model()
-NEG_WORDS = [r"problem", r"delay", r"failure", r"unacceptable", r"risk", r"critical", r"urgent"]
+def rule_sent(text:str)->str:
+    return "Negative" if any(re.search(w,text,re.I) for w in NEG_WORDS) else "Positive"
 
+def analyze_issue(text:str)->Tuple[str,str,bool]:
+    if sent_model:
+        label = sent_model(text[:512])[0]["label"].lower()
+        sentiment = "Negative" if label=="negative" else "Positive"
+    else:
+        sentiment = rule_sent(text)
+    urgency = "High" if any(k in text.lower() for k in ["urgent","immediate","critical"]) else "Low"
+    return sentiment, urgency, sentiment=="Negative" and urgency=="High"
 
-def rule_based_sentiment(text: str) -> str:
-    return "Negative" if any(re.search(w, text, re.I) for w in NEG_WORDS) else "Positive"
-
-
-def analyze_issue(text: str) -> Tuple[str, str, bool]:
-    sentiment = (
-        "Negative"
-        if sentiment_model and sentiment_model(text[:512])[0]["label"].lower() == "negative"
-        else "Positive"
-        if sentiment_model
-        else rule_based_sentiment(text)
-    )
-    urgency = "High" if any(k in text.lower() for k in ["urgent", "immediate", "critical"]) else "Low"
-    escalated = sentiment == "Negative" and urgency == "High"
-    return sentiment, urgency, escalated
-
-
-# ========== DB ==========
-
+# ========== DB init & helpers ==========
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        # Create escalations table with all required columns
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS escalations (
-                id TEXT PRIMARY KEY,
-                customer TEXT,
-                issue TEXT,
-                criticality TEXT,
-                impact TEXT,
-                sentiment TEXT,
-                urgency TEXT,
-                escalated INTEGER,
-                date_reported TEXT,
-                owner TEXT,
-                status TEXT,
-                action_taken TEXT,
-                risk_score REAL,
-                spoc_email TEXT,
-                spoc_boss_email TEXT,
-                spoc_notify_count INTEGER DEFAULT 0,
-                spoc_last_notified TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """
-        )
-        # Create notification log
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notification_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                escalation_id TEXT,
-                recipient_email TEXT,
-                subject TEXT,
-                body TEXT,
-                sent_at TEXT
-            )
-        """
-        )
-        conn.commit()
-
-        # Check for missing columns and add if needed
-        cur.execute("PRAGMA table_info(escalations)")
-        columns = [col[1] for col in cur.fetchall()]
-        # Add missing columns safely
-        required_columns = {
-            "spoc_notify_count": "INTEGER DEFAULT 0",
-            "spoc_last_notified": "TEXT",
-            "spoc_email": "TEXT",
-            "spoc_boss_email": "TEXT",
-        }
-        for col_name, col_type in required_columns.items():
-            if col_name not in columns:
-                try:
-                    cur.execute(f"ALTER TABLE escalations ADD COLUMN {col_name} {col_type}")
-                    print(f"Added missing column: {col_name}")
-                except Exception as e:
-                    print(f"Failed to add column {col_name}: {e}")
-        conn.commit()
-
-
-init_db()
-
-
-def upsert_case(case: dict):
-    with sqlite3.connect(DB_PATH) as conn:
-        keys = list(case.keys())
-        placeholders = ",".join("?" for _ in keys)
-        values = tuple(case[k] for k in keys)
-        conn.execute(
-            f"REPLACE INTO escalations ({','.join(keys)}) VALUES ({placeholders})", values
-        )
-        conn.commit()
-
-
-def fetch_cases() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query("SELECT * FROM escalations ORDER BY created_at DESC", conn)
-    return df
-
-
-# ========== Email ==========
-
-
-def send_email(to_email: str, subject: str, body: str, esc_id: str) -> bool:
-    if not (SMTP_SERVER and SMTP_USER and SMTP_PASS):
-        st.error("SMTP not configured")
-        return False
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = f"Escalation Notification - SE Services <{SMTP_USER}>"
-        msg["To"] = to_email
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        # Log sent notification
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO notification_log (escalation_id, recipient_email, subject, body, sent_at) VALUES (?,?,?,?,?)",
-                (esc_id, to_email, subject, body, datetime.now().isoformat()),
-            )
-            conn.commit()
-        return True
-    except Exception as e:
-        st.error(f"Email send failed: {e}")
-        return False
-
-
-# ========== ML Risk Predictor ==========
-
-MODEL_FILE = MODEL_DIR / "risk_model.joblib"
-
-
-@st.cache_resource(show_spinner=False)
-def load_model():
-    return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
-
-
-risk_model = load_model()
-
-
-def train_model(df: pd.DataFrame):
-    pipe = Pipeline(
-        [("tfidf", TfidfVectorizer(max_features=5000, stop_words="english")), ("clf", LogisticRegression(max_iter=1000))]
-    )
-    pipe.fit(df["issue"], df["escalated"].astype(int))
-    joblib.dump(pipe, MODEL_FILE)
-    return pipe
-
-
-def predict_risk(issue: str) -> float:
-    if risk_model:
-        return float(risk_model.predict_proba([issue])[0][1])
-    return 0.0
+        cur=conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS escalations (
+            id TEXT PRIMARY KEY,
+            customer TEXT,
+            issue TEXT,
+            criticality TEXT,
+            impact TEXT,
+            sentiment TEXT,
+            urgency TEXT,
+            escalated INTEGER,
+            date_reported TEXT,
+            owner TEXT,
+            status TEXT,
+            action_taken TEXT,
+            risk_score REAL,
+            spoc_email TEXT,
+            spoc_boss_email TEXT,
+            spoc_notify_count INTEGER DEFAULT 0,
+            spoc_last_notified TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            escalation_id TEXT,
+            recipient_email TEXT,
+            subject TEXT,
+            body TEXT,
+            sent_at TEXT)""")
+          conn.commit()
+          # Ensure upgraded cols
+          cur.execute("PRAGMA table_info(escalations)"); cols=[c[1] for c in cur.fetchall()]
+          need={"spoc_notify_count":"INTEGER DEFAULT 0","spoc_last_notified":"TEXT","spoc_email":"TEXT","spoc_boss_email":"TEXT"}
+          for c,t in need.items():
+              if c not in cols:
+                  try: cur.execute(f"ALTER TABLE escalations ADD COLUMN {c} {t}")
+                  except Exception: pass
+          conn.commit()
+  
+  init_db()
+  ESC_COLS=[c[1] for c in sqlite3.connect(DB_PATH).execute("PRAGMA table_info(escalations)").fetchall()]
+  
+  def upsert_case(case:dict):
+      data={k:case.get(k) for k in ESC_COLS}
+      with sqlite3.connect(DB_PATH) as conn:
+          conn.execute(f"REPLACE INTO escalations ({','.join(data.keys())}) VALUES ({','.join('?'*len(data))})", tuple(data.values()))
+          conn.commit()
+  
+  def fetch_cases()->pd.DataFrame:
+      with sqlite3.connect(DB_PATH) as conn:
+          return pd.read_sql_query("SELECT * FROM escalations ORDER BY created_at DESC", conn)
+  
+  def fetch_logs()->pd.DataFrame:
+      with sqlite3.connect(DB_PATH) as conn:
+          return pd.read_sql_query("SELECT * FROM notification_log ORDER BY sent_at DESC", conn)
+  
+  # ========== Email (retries) ==========
+  
+  def send_email(to_email:str, subject:str, body:str, esc_id:str, retries:int=3)->bool:
+      if not (SMTP_SERVER and SMTP_USER and SMTP_PASS):
+          st.error("SMTP not configured")
+          return False
+      attempt=0
+      while attempt<retries:
+          try:
+              msg=MIMEText(body);
+              msg["Subject"]=subject; msg["From"]=f"Escalation Notification - SE Services <{SMTP_USER}>"; msg["To"]=to_email
+              with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
+                  s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+              with sqlite3.connect(DB_PATH) as conn:
+                  conn.execute("INSERT INTO notification_log (escalation_id,recipient_email,subject,body,sent_at) VALUES (?,?,?,?,?)",
+                               (esc_id,to_email,subject,body,datetime.now().isoformat())); conn.commit()
+              return True
+          except Exception as e:
+              attempt+=1; time.sleep(2)
+              if attempt==retries:
+                  st.error(f"Email failed: {e}")
+                  return False
+  
+  # risk predictor stub
+  MODEL_FILE=MODEL_DIR/"risk_model.joblib"
+  @st.cache_resource(show_spinner=False)
+  def load_model():
+      return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
+  risk_model=load_model()
+  
+  def predict_risk(issue:str)->float:
+      return float(risk_model.predict_proba([issue])[0][1]) if risk_model else 0.0
+  
+  # Scheduler boss check
+  
+  def boss_check():
+      try:
+          df=fetch_cases()
+          for _,r in df.iterrows():
+              if r.get("spoc_notify_count",0)>=2 and r.get("spoc_boss_email") and r.get("spoc_last_notified"):
+                  if datetime.now()-datetime.fromisoformat(r["spoc_last_notified"])>timedelta(hours=24):
+                      subj=f"⚠️ Escalation {r['id']} unattended"; body=f"Dear Manager,\n\nEscalation {r['id']} requires your attention."
+                      if send_email(r["spoc_boss_email"],subj,body,r["id"]):
+                          upd=r.to_dict(); upd["spoc_notify_count"]+=1; upsert_case(upd)
+      except Exception as e:
+          st.warning(f"Scheduler error: {e}")
+  
+  if "sched" not in st.session_state:
+      sc=BackgroundScheduler(); sc.add
 
 
 # ========== Sidebar Upload & Manual Entry ==========
