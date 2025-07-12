@@ -1,1 +1,9 @@
-openpyxl==3.1.2  # (or the  latest version)
+streamlit
+pandas
+openpyxl
+python-dotenv
+transformers
+scikit-learn
+joblib
+requests
+apscheduler
