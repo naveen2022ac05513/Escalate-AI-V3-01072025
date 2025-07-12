@@ -285,6 +285,14 @@ if "sched" not in st.session_state:
     atexit.register(lambda: sc.shutdown(wait=False))  # shutdown scheduler on exit
     st.session_state["sched"] = True
 
+import io
+
+def to_excel(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, sheet_name='Escalations', index=False)
+    return output.getvalue()
+
 # ========== Streamlit UI ==========
 import streamlit as st
 st.set_page_config(page_title="EscalateAI", layout="wide")
