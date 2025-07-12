@@ -20,9 +20,9 @@ streamlit run escalateai_full_code.py
 """
 
 import os, re, sqlite3, warnings, atexit
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple
 
 import joblib, pandas as pd, requests, streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -30,8 +30,6 @@ from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-import smtplib
-from email.message import EmailMessage
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
@@ -43,11 +41,6 @@ DB_PATH = DATA_DIR / "escalateai.db"
 load_dotenv()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 ALERT_CHANNEL_ENABLED = bool(SLACK_WEBHOOK_URL)
-
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
 
 # ========== Sentiment Model Loading ==========
 try:
@@ -86,16 +79,6 @@ NEG_WORDS = [
 def rule_based_sentiment(text: str) -> str:
     return "Negative" if any(re.search(w, text, re.I) for w in NEG_WORDS) else "Positive"
 
-NEG_URGENCY_KWS = ["urgent", "immediately", "asap", "critical", "high priority", "now"]
-
-def analyze_issue(text: str) -> Tuple[str, str, bool]:
-    if sentiment_model is None:
-        sentiment = rule_based_sentiment(text)
-    else:
-        sentiment = "Negative" if sentiment_model(text[:512])[0]["label"].lower() == "negative" else "Positive"
-    urgency = "High" if any(k in text.lower() for k in NEG_URGENCY_KWS) else "Low"
-    return sentiment, urgency, sentiment == "Negative" and urgency == "High"
-
 # ========== Initialize Database ==========
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -127,62 +110,57 @@ def init_db():
 
 init_db()
 
-def next_escalation_id() -> str:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id FROM escalations ORDER BY created_at DESC LIMIT 1")
-    last_id = c.fetchone()
-    conn.close()
-    if last_id and last_id[0].startswith("CESI-"):
-        num = int(last_id[0].split("-")[1])
-        return f"CESI-{num + 1:06d}"
-    else:
-        return "CESI-000001"
+# ========== Additional Functions (DB, Risk, UI Placeholder) ========== 
+
+ESCALATION_COLUMNS = {
+    "id", "customer", "issue", "criticality", "impact", "sentiment", "urgency",
+    "escalated", "date_reported", "owner", "status", "action_taken", "risk_score",
+    "spoc_email", "spoc_boss_email", "notif_count", "last_notif", "created_at"
+}
+
+ESCALATION_COLUMNS_NO_CREATED_AT = ESCALATION_COLUMNS - {"created_at"}
 
 def upsert_case(case: dict):
+    # Filter keys to those matching DB schema except created_at (auto timestamp)
+    filtered_case = {k: v for k, v in case.items() if k in ESCALATION_COLUMNS_NO_CREATED_AT}
+    keys = ','.join(filtered_case.keys())
+    question_marks = ','.join(['?'] * len(filtered_case))
+    values = tuple(filtered_case.values())
     with sqlite3.connect(DB_PATH) as conn:
-        keys = ','.join(case.keys())
-        question_marks = ','.join(['?'] * len(case))
-        values = tuple(case.values())
         conn.execute(f"REPLACE INTO escalations ({keys}) VALUES ({question_marks})", values)
         conn.commit()
 
 def fetch_cases() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql_query("SELECT * FROM escalations ORDER BY date_reported DESC", conn)
-
-# ----------------------------
-# ML RISK PREDICTOR (Sklearn)
-# ----------------------------
-
-MODEL_FILE = MODEL_DIR / "risk_predictor.joblib"
+        return pd.read_sql_query("SELECT * FROM escalations", conn)
 
 @st.cache_resource(show_spinner=False)
 def load_predictor():
-    return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
+    model_path = MODEL_DIR / "risk_predictor.joblib"
+    return joblib.load(model_path) if model_path.exists() else None
 
 risk_model = load_predictor()
 
-def train_predictor(df_lbl: pd.DataFrame):
-    if df_lbl.empty:
-        return None
-    pipe = Pipeline([
-        ("tfidf", TfidfVectorizer(stop_words="english", max_features=5000)),
-        ("clf", LogisticRegression(max_iter=1000)),
-    ])
-    pipe.fit(df_lbl["issue"], df_lbl["escalated"].astype(int))
-    joblib.dump(pipe, MODEL_FILE)
-    return pipe
-
 def predict_risk(issue: str) -> float:
-    if risk_model is None:
+    if not risk_model:
         return 0.0
-    return float(round(risk_model.predict_proba([issue])[0][1], 3))
+    return float(risk_model.predict_proba([issue])[0][1])
 
 # ----------------------------
-# ALERTING (Slack)
-# ----------------------------
 
+def analyze_issue(text: str) -> Tuple[str, str, bool]:
+    # Simple urgency keywords
+    NEG_URGENCY_KWS = ["urgent", "immediate", "asap", "critical", "high priority", "emergency"]
+    if sentiment_model is None:
+        sentiment = rule_based_sentiment(text)
+    else:
+        sentiment = "Negative" if sentiment_model(text[:512])[0]["label"].lower() == "negative" else "Positive"
+    urgency = "High" if any(k in text.lower() for k in NEG_URGENCY_KWS) else "Low"
+    escalated = sentiment == "Negative" and urgency == "High"
+    return sentiment, urgency, escalated
+
+# ----------------------------
+# SLACK Alert (if enabled)
 def send_slack_alert(case: dict):
     if not ALERT_CHANNEL_ENABLED:
         return
@@ -197,65 +175,48 @@ def send_slack_alert(case: dict):
         warnings.warn(f"Slack webhook failed: {e}")
 
 # ----------------------------
-# EMAIL SENDING (SMTP)
-# ----------------------------
-
-def send_email(to_email: str, subject: str, body: str):
-    if not SMTP_USER or not SMTP_PASS:
-        st.warning("SMTP credentials not set. Email not sent.")
-        return
-    msg = EmailMessage()
-    msg["From"] = SMTP_USER
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
-    try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
-            smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.send_message(msg)
-    except Exception as e:
-        st.error(f"Error sending email: {e}")
-
-# ----------------------------
-# FILE INGESTION HELPERS
-# ----------------------------
-
+# File ingestion
 def standardize_columns(df: pd.DataFrame):
     df.columns = df.columns.str.strip().str.lower().str.replace(r"\s+", " ", regex=True)
     return df
+
+def next_escalation_id() -> str:
+    # Generate a new unique escalation ID like ESC-000001
+    df = fetch_cases()
+    if df.empty:
+        return "ESC-000001"
+    max_id = df['id'].apply(lambda x: int(x.split("-")[1]) if x and "-" in x else 0).max()
+    return f"ESC-{max_id + 1:06d}"
 
 def ingest_dataframe(df: pd.DataFrame):
     df = standardize_columns(df)
     for _, row in df.iterrows():
         sentiment, urgency, escal = analyze_issue(str(row.get("brief issue", "")))
         case = {
-            "id":             next_escalation_id(),
-            "customer":       row.get("customer", "Unknown"),
-            "issue":          row.get("brief issue", "Unknown"),
-            "criticality":    row.get("criticalness", "Unknown"),
-            "impact":         row.get("impact", "Unknown"),
-            "sentiment":      sentiment,
-            "urgency":        urgency,
-            "escalated":      int(escal),
-            "date_reported":  str(row.get("issue reported date", datetime.today().date())),
-            "owner":          row.get("owner", "Unassigned"),
-            "status":         row.get("status", "Open"),
-            "action_taken":   row.get("action taken", "None"),
-            "risk_score":     predict_risk(row.get("brief issue", "")),
-            "spoc_email":     row.get("spoc email", ""),
-            "spoc_boss_email":row.get("spoc boss email", ""),
-            "notif_count":    0,
-            "last_notif":     None,
+            "id": next_escalation_id(),
+            "customer": row.get("customer", "Unknown"),
+            "issue": row.get("brief issue", "Unknown"),
+            "criticality": row.get("criticalness", "Unknown"),
+            "impact": row.get("impact", "Unknown"),
+            "sentiment": sentiment,
+            "urgency": urgency,
+            "escalated": int(escal),
+            "date_reported": str(row.get("issue reported date", datetime.today().date())),
+            "owner": row.get("owner", "Unassigned"),
+            "status": row.get("status", "Open"),
+            "action_taken": row.get("action taken", "None"),
+            "risk_score": predict_risk(row.get("brief issue", "")),
+            "spoc_email": row.get("spoc email", ""),
+            "spoc_boss_email": row.get("spoc boss email", ""),
+            "notif_count": 0,
+            "last_notif": None,
         }
         upsert_case(case)
         if escal:
             send_slack_alert(case)
 
 # ----------------------------
-# SCHEDULER – DAILY RETRAIN & ESCALATION CHECK
-# ----------------------------
-
+# Scheduler – placeholder for retraining etc.
 def daily_retrain():
     df_all = fetch_cases()
     if not df_all.empty and "escalated" in df_all.columns:
@@ -263,71 +224,15 @@ def daily_retrain():
         risk_model = train_predictor(df_all[["issue", "escalated"]])
         print("[Scheduler] Risk model retrained", datetime.now())
 
-def check_and_send_escalations():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    now = datetime.now()
-    c.execute("SELECT * FROM escalations WHERE escalated=1")
-    rows = c.fetchall()
-    col_names = [desc[0] for desc in c.description]
-    for row in rows:
-        case = dict(zip(col_names, row))
-        last_notif_dt = datetime.fromisoformat(case["last_notif"]) if case["last_notif"] else None
-        notif_count = case["notif_count"] or 0
-        spoc_email = case.get("spoc_email", "")
-        spoc_boss_email = case.get("spoc_boss_email", "")
-        # If no SPOC email, skip
-        if not spoc_email or "@" not in spoc_email:
-            continue
-        # If no notifications sent yet or last notification older than 24h
-        if notif_count < 2 and (not last_notif_dt or now - last_notif_dt > timedelta(hours=24)):
-            # Send notification to SPOC
-            try:
-                send_email(
-                    spoc_email,
-                    f"Reminder: Escalation {case['id']} Requires Your Attention",
-                    f"Dear SPOC,\n\nThis is a reminder for escalation {case['id']} regarding:\n\n{case['issue']}\n\nPlease take necessary action.\n\nRegards,\nEscalateAI"
-                )
-                c.execute("""
-                    UPDATE escalations
-                    SET notif_count = notif_count + 1,
-                        last_notif = ?
-                    WHERE id = ?
-                """, (now.isoformat(), case['id']))
-                conn.commit()
-            except Exception as e:
-                warnings.warn(f"Email notification failed: {e}")
-        # After 2 notifications, escalate to boss if no response (status still Open or In Progress)
-        elif notif_count >= 2 and case['status'] in ("Open", "In Progress") and spoc_boss_email and "@" in spoc_boss_email:
-            try:
-                send_email(
-                    spoc_boss_email,
-                    f"Escalation Alert: {case['id']} Needs Your Attention",
-                    f"Dear Manager,\n\nThe escalation {case['id']} has not been addressed by the SPOC.\n\nIssue:\n{case['issue']}\n\nPlease intervene.\n\nRegards,\nEscalateAI"
-                )
-                # Mark escalation escalated to boss by setting notif_count to a high number (e.g. 99)
-                c.execute("""
-                    UPDATE escalations
-                    SET notif_count = 99,
-                        last_notif = ?
-                    WHERE id = ?
-                """, (now.isoformat(), case['id']))
-                conn.commit()
-            except Exception as e:
-                warnings.warn(f"Email escalation to boss failed: {e}")
-
-    conn.close()
-
 scheduler = BackgroundScheduler()
 scheduler.add_job(daily_retrain, "cron", hour=2)
-scheduler.add_job(check_and_send_escalations, "interval", hours=1)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown(wait=False))
 
 # ----------------------------
-# STREAMLIT UI
-# ----------------------------
+# Streamlit UI
 
+init_db()
 st.set_page_config(page_title="EscalateAI", layout="wide")
 st.title("🚨 EscalateAI – Escalation Tracking System")
 
@@ -376,21 +281,20 @@ with st.sidebar:
                 send_slack_alert(case)
             st.success(f"Escalation {case['id']} logged!")
 
-# ---------- Kanban Board ----------
-
+# ---------- Kanban Board Summary ----------
 df = fetch_cases()
+
 if df.empty:
     st.info("No escalations logged yet.")
 else:
-    st.subheader("🗂️ Escalation Kanban Board")
-
     # Summary counts
-    open_count = (df.status == "Open").sum()
-    inprogress_count = (df.status == "In Progress").sum()
-    resolved_count = (df.status == "Resolved").sum()
+    open_count = df[df.status == "Open"].shape[0]
+    inprogress_count = df[df.status == "In Progress"].shape[0]
+    resolved_count = df[df.status == "Resolved"].shape[0]
 
     st.markdown(f"### Summary: Open: {open_count} | In Progress: {inprogress_count} | Resolved: {resolved_count}")
 
+    st.subheader("🗂️ Escalation Kanban Board")
     cols = st.columns(3)
     for status, col in zip(["Open", "In Progress", "Resolved"], cols):
         with col:
@@ -400,52 +304,19 @@ else:
                     st.markdown(f"**Customer:** {row['customer']}")
                     st.markdown(f"**Sentiment / Urgency:** {row['sentiment']} / {row['urgency']}")
                     st.markdown(f"**Owner:** {row['owner']}")
-                    st.markdown(f"**SPOC Email:** {row.get('spoc_email','')}")
-                    st.markdown(f"**SPOC Boss Email:** {row.get('spoc_boss_email','')}")
                     st.markdown(f"**Risk Score:** {row['risk_score']}")
-
                     new_status = st.selectbox("Update Status", ["Open", "In Progress", "Resolved"],
-                        index=["Open", "In Progress", "Resolved"].index(row["status"]),
-                        key=f"status_{row['id']}")
+                                             index=["Open", "In Progress", "Resolved"].index(row["status"]),
+                                             key=f"status_{row['id']}")
                     new_action = st.text_input("Action Taken", value=row["action_taken"], key=f"act_{row['id']}")
-                    spoc_email_inp = st.text_input("SPOC Email", value=row.get("spoc_email",""), key=f"spoc_email_{row['id']}")
-                    spoc_boss_email_inp = st.text_input("SPOC Boss Email", value=row.get("spoc_boss_email",""), key=f"spoc_boss_email_{row['id']}")
-
-                    if (new_status != row["status"] or new_action != row["action_taken"] or
-                        spoc_email_inp != row.get("spoc_email","") or spoc_boss_email_inp != row.get("spoc_boss_email","")):
-                        row["status"] = new_status
-                        row["action_taken"] = new_action
-                        row["spoc_email"] = spoc_email_inp
-                        row["spoc_boss_email"] = spoc_boss_email_inp
-                        upsert_case(row.to_dict())
+                    if new_status != row["status"] or new_action != row["action_taken"]:
+                        # Update and save changes
+                        updated_case = row.to_dict()
+                        updated_case["status"] = new_status
+                        updated_case["action_taken"] = new_action
+                        upsert_case(updated_case)
                         st.experimental_rerun()
 
-                    if st.button("Notify SPOC", key=f"notify_{row['id']}"):
-                        spoc_email_val = row.get("spoc_email", "")
-                        if spoc_email_val and "@" in spoc_email_val:
-                            try:
-                                send_email(
-                                    spoc_email_val,
-                                    f"Escalation {row['id']} Status Update",
-                                    f"Dear SPOC,\n\nThe escalation with ID {row['id']} and issue:\n\n{row['issue']}\n\n"
-                                    f"Has been updated to status: {new_status}.\n\nRegards,\nEscalateAI"
-                                )
-                                with sqlite3.connect(DB_PATH) as conn:
-                                    c = conn.cursor()
-                                    c.execute("""
-                                        UPDATE escalations
-                                        SET notif_count = notif_count + 1,
-                                            last_notif = ?
-                                        WHERE id = ?
-                                    """, (datetime.now().isoformat(), row['id']))
-                                    conn.commit()
-                                st.success(f"Notification sent to {spoc_email_val}")
-                            except Exception as e:
-                                st.error(f"Failed to send email: {e}")
-                        else:
-                            st.warning("Please enter a valid SPOC email address.")
-
-    # Export Button
     st.download_button(
         "⬇️ Download as Excel",
         data=df.to_excel(index=False, engine="openpyxl"),
