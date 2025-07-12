@@ -248,7 +248,6 @@ def scheduled_daily_retrain():
 scheduler = BackgroundScheduler()
 scheduler.add_job(scheduled_daily_retrain, "cron", hour=2, minute=0)
 scheduler.start()
-
 # ----------------------------
 # STREAMLIT UI
 # ----------------------------
