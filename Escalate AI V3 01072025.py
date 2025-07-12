@@ -430,15 +430,12 @@ else:
 
 # ========== Download Escalation Data as Excel ==========
 
-def to_excel(df: pd.DataFrame) -> bytes:
-    """
-    Convert dataframe to Excel bytes for download
-    """
-    import io
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+from io import BytesIO
+
+def to_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Escalations')
-        writer.save()
     return output.getvalue()
 
 st.markdown("---")
