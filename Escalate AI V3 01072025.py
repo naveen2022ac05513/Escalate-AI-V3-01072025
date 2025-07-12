@@ -1,7 +1,7 @@
 # ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v0.9.2)
+# EscalateAI – End‑to‑End Escalation Management System (v0.9.3)
 # --------------------------------------------------------------
-# • Full single‑file implementation (no omissions / ellipses)
+# • Full single‑file implementation
 # • Robust fallback sentiment (no torch required)
 # • SQLite persistence + daily model retraining
 # • Streamlit Kanban UI with filters & inline edits
@@ -19,9 +19,6 @@ export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/…"
 streamlit run escalateai_full_code.py
 """
 
-# ----------------------------
-# STANDARD LIBS & THIRD‑PARTY
-# ----------------------------
 import os, re, sqlite3, warnings, atexit
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +31,10 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
-# transformers & torch are optional – fallback rule‑based sentiment if either missing
+APP_DIR = Path(__file__).resolve().parent
+MODEL_DIR = APP_DIR / "models"
+MODEL_DIR.mkdir(exist_ok=True)
+
 try:
     from transformers import pipeline as hf_pipeline
     _has_transformers = True
@@ -42,32 +42,34 @@ except ModuleNotFoundError:
     _has_transformers = False
 
 try:
-    import torch  # noqa: F401 – just to check availability
+    import torch
     _has_torch = True
 except ModuleNotFoundError:
     _has_torch = False
 
-# We'll only attempt HF pipeline if BOTH are present
 _use_hf = _has_transformers and _has_torch
 
 @st.cache_resource(show_spinner=False)
 def load_sentiment_model():
-    if not _has_transformers:
-        st.sidebar.warning("Transformers not installed – using rule‑based sentiment.")
+    if not _use_hf:
+        st.sidebar.warning("Transformers or Torch not available – using rule‑based sentiment.")
         return None
     try:
         return hf_pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment")
     except Exception as e:
-        st.sidebar.warning(f"HF model load failed ({e}) – falling back to rule‑based sentiment.")
+        st.sidebar.warning(f"HF model load failed ({e}) – fallback to rule‑based.")
         return None
 
 sentiment_model = load_sentiment_model()
 
-# Simple fallback negative word list
 NEG_WORDS = [
     r"problem", r"delay", r"issue", r"failure", r"dissatisfaction", r"unacceptable",
     r"complaint", r"unresolved", r"unstable", r"defective", r"critical", r"risk",
 ]
+
+@st.cache_data(show_spinner=False)
+def rule_based_sentiment(text: str) -> str:
+    return "Negative" if any(re.search(w, text, re.I) for w in NEG_WORDS) else "Positive"
 
 
 def rule_based_sentiment(text: str) -> str:
