@@ -71,7 +71,7 @@ def load_sentiment():
 
 sent_model = load_sentiment()
 negative_words = [
-    r"\b(problematic|delay|issue|failure|dissatisfaction|frustration|unacceptable|mistake|complaint|unresolved|unresponsive|unstable|broken|defective|overdue|escalation|leakage|damage|burnt|critical|risk|dispute|faulty)\b"
+    r"\b(problematic|mismatch|delay|issue|failure|dissatisfaction|frustration|unacceptable|mistake|complaint|unresolved|unresponsive|unstable|broken|defective|overdue|escalation|leakage|damage|burnt|critical|risk|dispute|faulty)\b"
 ]
 NEG_WORDS = negative_words
 
