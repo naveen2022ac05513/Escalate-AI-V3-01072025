@@ -1,24 +1,4 @@
-# ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v0.9.3)
-# --------------------------------------------------------------
-# • Full single‑file implementation
-# • Robust fallback sentiment (no torch required)
-# • SQLite persistence + daily model retraining
-# • Streamlit Kanban UI with filters & inline edits
-# --------------------------------------------------------------
-# Author: Naveen Gandham • July 2025
-# ==============================================================
-
-"""Quick‑start (terminal):
-
-pip install streamlit pandas openpyxl python-dotenv transformers scikit-learn joblib requests apscheduler
-# Optional (better accuracy – only if PyTorch wheel available for your Python):
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/…"
-streamlit run escalateai_full_code.py
-"""
-
+import io
 import os, re, sqlite3, warnings, atexit
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +11,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
+# Directories and env
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
@@ -42,7 +23,7 @@ load_dotenv()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 ALERT_CHANNEL_ENABLED = bool(SLACK_WEBHOOK_URL)
 
-# ========== Sentiment Model Loading ==========
+# Sentiment model loading (transformers + torch fallback)
 try:
     from transformers import pipeline as hf_pipeline
     _has_transformers = True
@@ -75,13 +56,18 @@ NEG_WORDS = [
     r"complaint", r"unresolved", r"unstable", r"defective", r"critical", r"risk",
 ]
 
-NEG_URGENCY_KWS = [
-    "urgent", "immediately", "critical", "asap", "business impact", "high priority"
-]
-
 @st.cache_data(show_spinner=False)
 def rule_based_sentiment(text: str) -> str:
     return "Negative" if any(re.search(w, text, re.I) for w in NEG_WORDS) else "Positive"
+
+NEG_URGENCY_KWS = [
+    "urgent",
+    "critical",
+    "immediately",
+    "asap",
+    "business impact",
+    "high priority",
+]
 
 def analyze_issue(text: str) -> Tuple[str, str, bool]:
     if sentiment_model is None:
@@ -92,7 +78,7 @@ def analyze_issue(text: str) -> Tuple[str, str, bool]:
     escalated = sentiment == "Negative" and urgency == "High"
     return sentiment, urgency, escalated
 
-# ========== Initialize Database ==========
+# Initialize DB
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -119,13 +105,6 @@ def init_db():
 
 init_db()
 
-def next_escalation_id() -> str:
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM escalations")
-        count = cur.fetchone()[0]
-    return f"ESC-{10001 + count}"
-
 def upsert_case(case: dict):
     with sqlite3.connect(DB_PATH) as conn:
         keys = ','.join(case.keys())
@@ -138,12 +117,19 @@ def fetch_cases() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query("SELECT * FROM escalations", conn)
 
+# Risk model
+MODEL_FILE = MODEL_DIR / "risk_predictor.joblib"
+
 @st.cache_resource(show_spinner=False)
 def load_predictor():
-    model_path = MODEL_DIR / "risk_predictor.joblib"
-    return joblib.load(model_path) if model_path.exists() else None
+    return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
 
 risk_model = load_predictor()
+
+def predict_risk(issue: str) -> float:
+    if not risk_model:
+        return 0.0
+    return float(risk_model.predict_proba([issue])[0][1])
 
 def train_predictor(df_lbl: pd.DataFrame):
     if df_lbl.empty:
@@ -153,13 +139,8 @@ def train_predictor(df_lbl: pd.DataFrame):
         ("clf", LogisticRegression(max_iter=1000)),
     ])
     pipe.fit(df_lbl["issue"], df_lbl["escalated"].astype(int))
-    joblib.dump(pipe, MODEL_DIR / "risk_predictor.joblib")
+    joblib.dump(pipe, MODEL_FILE)
     return pipe
-
-def predict_risk(issue: str) -> float:
-    if risk_model is None:
-        return 0.0
-    return float(round(risk_model.predict_proba([issue])[0][1], 3))
 
 def send_slack_alert(case: dict):
     if not ALERT_CHANNEL_ENABLED:
@@ -173,6 +154,13 @@ def send_slack_alert(case: dict):
         requests.post(SLACK_WEBHOOK_URL, json={"text": msg}, timeout=5)
     except requests.exceptions.RequestException as e:
         warnings.warn(f"Slack webhook failed: {e}")
+
+def next_escalation_id() -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM escalations")
+        count = c.fetchone()[0]
+    return f"ESC-{10000 + count + 1}"
 
 def standardize_columns(df: pd.DataFrame):
     df.columns = df.columns.str.strip().str.lower().str.replace(r"\s+", " ", regex=True)
@@ -213,12 +201,10 @@ scheduler.add_job(daily_retrain, "cron", hour=2)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown(wait=False))
 
-# ---------------------------- STREAMLIT UI ----------------------------
-
+# Streamlit UI
 st.set_page_config(page_title="EscalateAI", layout="wide")
 st.title("🚨 EscalateAI – Escalation Tracking System")
 
-# Sidebar - Upload and Manual Entry
 with st.sidebar:
     st.header("📥 Upload Escalations")
     f = st.file_uploader("Excel / CSV", type=["xlsx", "csv"])
@@ -257,7 +243,6 @@ with st.sidebar:
                 send_slack_alert(case)
             st.success(f"Escalation {case['id']} logged!")
 
-# Kanban Board
 df = fetch_cases()
 if df.empty:
     st.info("No escalations logged yet.")
@@ -267,8 +252,7 @@ else:
     for status, col in zip(["Open", "In Progress", "Resolved"], cols):
         with col:
             st.markdown(f"### {status}")
-            subset = df[df.status == status]
-            for _, row in subset.iterrows():
+            for _, row in df[df.status == status].iterrows():
                 with st.expander(f"{row['id']} – {row['issue'][:60]}..."):
                     st.markdown(f"**Customer:** {row['customer']}")
                     st.markdown(f"**Sentiment / Urgency:** {row['sentiment']} / {row['urgency']}")
@@ -281,7 +265,9 @@ else:
                         key=f"status_{row['id']}"
                     )
                     new_action = st.text_input(
-                        "Action Taken", value=row["action_taken"], key=f"act_{row['id']}"
+                        "Action Taken",
+                        value=row["action_taken"],
+                        key=f"act_{row['id']}"
                     )
                     if new_status != row["status"] or new_action != row["action_taken"]:
                         row["status"] = new_status
@@ -289,9 +275,15 @@ else:
                         upsert_case(row.to_dict())
                         st.experimental_rerun()
 
+    # Fix here: Excel download via BytesIO buffer
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    data = output.getvalue()
+
     st.download_button(
         "⬇️ Download as Excel",
-        data=df.to_excel(index=False, engine="openpyxl"),
+        data=data,
         file_name="escalations_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
