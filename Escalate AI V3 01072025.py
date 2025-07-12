@@ -118,115 +118,82 @@ def init_db():
             subject TEXT,
             body TEXT,
             sent_at TEXT)""")
-          conn.commit()
-          # Ensure upgraded cols
-          cur.execute("PRAGMA table_info(escalations)"); cols=[c[1] for c in cur.fetchall()]
-          need={"spoc_notify_count":"INTEGER DEFAULT 0","spoc_last_notified":"TEXT","spoc_email":"TEXT","spoc_boss_email":"TEXT"}
-          for c,t in need.items():
-              if c not in cols:
-                  try: cur.execute(f"ALTER TABLE escalations ADD COLUMN {c} {t}")
-                  except Exception: pass
-          conn.commit()
-  
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS escalations (
-            id TEXT PRIMARY KEY,
-            customer TEXT,
-            issue TEXT,
-            criticality TEXT,
-            impact TEXT,
-            sentiment TEXT,
-            urgency TEXT,
-            escalated INTEGER,
-            date_reported TEXT,
-            owner TEXT,
-            status TEXT,
-            action_taken TEXT,
-            risk_score REAL,
-            spoc_email TEXT,
-            spoc_boss_email TEXT,
-            spoc_notify_count INTEGER DEFAULT 0,
-            spoc_last_notified TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS notification_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            escalation_id TEXT,
-            recipient_email TEXT,
-            subject TEXT,
-            body TEXT,
-            sent_at TEXT)""")
-
         conn.commit()
-
         # Ensure upgraded cols
-        cur.execute("PRAGMA table_info(escalations)")
-        cols = [c[1] for c in cur.fetchall()]
-        need = {
-            "spoc_notify_count": "INTEGER DEFAULT 0",
-            "spoc_last_notified": "TEXT",
-            "spoc_email": "TEXT",
-            "spoc_boss_email": "TEXT"
-        }
-        for c, t in need.items():
+        cur.execute("PRAGMA table_info(escalations)"); cols=[c[1] for c in cur.fetchall()]
+        need={"spoc_notify_count":"INTEGER DEFAULT 0","spoc_last_notified":"TEXT","spoc_email":"TEXT","spoc_boss_email":"TEXT"}
+        for c,t in need.items():
             if c not in cols:
-                try:
-                    cur.execute(f"ALTER TABLE escalations ADD COLUMN {c} {t}")
-                except Exception:
-                    pass
+                try: cur.execute(f"ALTER TABLE escalations ADD COLUMN {c} {t}")
+                except Exception: pass
         conn.commit()
 
-  # ========== Email (retries) ==========
-  
-  def send_email(to_email:str, subject:str, body:str, esc_id:str, retries:int=3)->bool:
-      if not (SMTP_SERVER and SMTP_USER and SMTP_PASS):
-          st.error("SMTP not configured")
-          return False
-      attempt=0
-      while attempt<retries:
-          try:
-              msg=MIMEText(body);
-              msg["Subject"]=subject; msg["From"]=f"Escalation Notification - SE Services <{SMTP_USER}>"; msg["To"]=to_email
-              with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
-                  s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
-              with sqlite3.connect(DB_PATH) as conn:
-                  conn.execute("INSERT INTO notification_log (escalation_id,recipient_email,subject,body,sent_at) VALUES (?,?,?,?,?)",
-                               (esc_id,to_email,subject,body,datetime.now().isoformat())); conn.commit()
-              return True
-          except Exception as e:
-              attempt+=1; time.sleep(2)
-              if attempt==retries:
-                  st.error(f"Email failed: {e}")
-                  return False
-  
-  # risk predictor stub
-  MODEL_FILE=MODEL_DIR/"risk_model.joblib"
-  @st.cache_resource(show_spinner=False)
-  def load_model():
-      return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
-  risk_model=load_model()
-  
-  def predict_risk(issue:str)->float:
-      return float(risk_model.predict_proba([issue])[0][1]) if risk_model else 0.0
-  
-  # Scheduler boss check
-  
-  def boss_check():
-      try:
-          df=fetch_cases()
-          for _,r in df.iterrows():
-              if r.get("spoc_notify_count",0)>=2 and r.get("spoc_boss_email") and r.get("spoc_last_notified"):
-                  if datetime.now()-datetime.fromisoformat(r["spoc_last_notified"])>timedelta(hours=24):
-                      subj=f"⚠️ Escalation {r['id']} unattended"; body=f"Dear Manager,\n\nEscalation {r['id']} requires your attention."
-                      if send_email(r["spoc_boss_email"],subj,body,r["id"]):
-                          upd=r.to_dict(); upd["spoc_notify_count"]+=1; upsert_case(upd)
-      except Exception as e:
-          st.warning(f"Scheduler error: {e}")
-  
-  if "sched" not in st.session_state:
-      sc=BackgroundScheduler(); sc.add
+init_db()
+ESC_COLS=[c[1] for c in sqlite3.connect(DB_PATH).execute("PRAGMA table_info(escalations)").fetchall()]
+
+def upsert_case(case:dict):
+    data={k:case.get(k) for k in ESC_COLS}
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(f"REPLACE INTO escalations ({','.join(data.keys())}) VALUES ({','.join('?'*len(data))})", tuple(data.values()))
+        conn.commit()
+
+def fetch_cases()->pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query("SELECT * FROM escalations ORDER BY created_at DESC", conn)
+
+def fetch_logs()->pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query("SELECT * FROM notification_log ORDER BY sent_at DESC", conn)
+
+# ========== Email (retries) ==========
+
+def send_email(to_email:str, subject:str, body:str, esc_id:str, retries:int=3)->bool:
+    if not (SMTP_SERVER and SMTP_USER and SMTP_PASS):
+        st.error("SMTP not configured")
+        return False
+    attempt=0
+    while attempt<retries:
+        try:
+            msg=MIMEText(body);
+            msg["Subject"]=subject; msg["From"]=f"Escalation Notification - SE Services <{SMTP_USER}>"; msg["To"]=to_email
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
+                s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO notification_log (escalation_id,recipient_email,subject,body,sent_at) VALUES (?,?,?,?,?)",
+                             (esc_id,to_email,subject,body,datetime.now().isoformat())); conn.commit()
+            return True
+        except Exception as e:
+            attempt+=1; time.sleep(2)
+            if attempt==retries:
+                st.error(f"Email failed: {e}")
+                return False
+
+# risk predictor stub
+MODEL_FILE=MODEL_DIR/"risk_model.joblib"
+@st.cache_resource(show_spinner=False)
+def load_model():
+    return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
+risk_model=load_model()
+
+def predict_risk(issue:str)->float:
+    return float(risk_model.predict_proba([issue])[0][1]) if risk_model else 0.0
+
+# Scheduler boss check
+
+def boss_check():
+    try:
+        df=fetch_cases()
+        for _,r in df.iterrows():
+            if r.get("spoc_notify_count",0)>=2 and r.get("spoc_boss_email") and r.get("spoc_last_notified"):
+                if datetime.now()-datetime.fromisoformat(r["spoc_last_notified"])>timedelta(hours=24):
+                    subj=f"⚠️ Escalation {r['id']} unattended"; body=f"Dear Manager,\n\nEscalation {r['id']} requires your attention."
+                    if send_email(r["spoc_boss_email"],subj,body,r["id"]):
+                        upd=r.to_dict(); upd["spoc_notify_count"]+=1; upsert_case(upd)
+    except Exception as e:
+        st.warning(f"Scheduler error: {e}")
+
+if "sched" not in st.session_state:
+    sc=BackgroundScheduler(); sc.add
 
 
 # ========== Sidebar Upload & Manual Entry ==========
