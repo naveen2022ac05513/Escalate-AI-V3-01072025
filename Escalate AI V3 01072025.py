@@ -1,33 +1,17 @@
 # ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v1.1.2)
+# EscalateAI – End‑to‑End Escalation Management System (v1.2.0)
 # --------------------------------------------------------------
 # • Full single‑file Streamlit app
 # • SQLite persistence & auto‑schema upgrade
 # • Sentiment (HF or rule‑based) + risk ML model
-# • Sidebar: Excel/CSV upload  & manual entry
+# • Sidebar: Excel/CSV upload & manual entry
 # • Kanban board with inline edits & notifications
-# • Notification History viewer
+# • Notification History viewer & Email Logs
 # • Robust SMTP email with retries
 # • Scheduler escalates to boss after 2 SPOC emails & 24 h
 # --------------------------------------------------------------
 # Author: Naveen Gandham • July 2025
 # ==============================================================
-
-"""Quick‑start:
-
-pip install streamlit pandas openpyxl python-dotenv transformers scikit-learn joblib requests apscheduler
-# (Optional) better accuracy – only if PyTorch wheel available:
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# .env (same folder)
-SMTP_SERVER=smtp.mail.yahoo.com
-SMTP_PORT=587
-SMTP_USER=naveengandham@yahoo.co.in
-SMTP_PASS=<YAHOO_APP_PASSWORD>
-SLACK_WEBHOOK_URL=
-
-streamlit run escalateai_app.py
-"""
 
 import os, re, sqlite3, atexit, smtplib, time
 from email.mime.text import MIMEText
@@ -41,6 +25,9 @@ from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
+
+# ========== Set Page Config ==========
+st.set_page_config(page_title="EscalateAI", layout="wide")
 
 # ========== Paths & ENV ==========
 APP_DIR   = Path(__file__).resolve().parent
@@ -119,7 +106,6 @@ def init_db():
             body TEXT,
             sent_at TEXT)""")
         conn.commit()
-        # Ensure upgraded cols
         cur.execute("PRAGMA table_info(escalations)"); cols=[c[1] for c in cur.fetchall()]
         need={"spoc_notify_count":"INTEGER DEFAULT 0","spoc_last_notified":"TEXT","spoc_email":"TEXT","spoc_boss_email":"TEXT"}
         for c,t in need.items():
@@ -154,8 +140,10 @@ def send_email(to_email:str, subject:str, body:str, esc_id:str, retries:int=3)->
     attempt=0
     while attempt<retries:
         try:
-            msg=MIMEText(body);
-            msg["Subject"]=subject; msg["From"]=f"Escalation Notification - SE Services <{SMTP_USER}>"; msg["To"]=to_email
+            msg=MIMEText(body)
+            msg["Subject"]=subject
+            msg["From"]=f"Escalation Notification - SE Services <{SMTP_USER}>"
+            msg["To"]=to_email
             with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
                 s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
             with sqlite3.connect(DB_PATH) as conn:
