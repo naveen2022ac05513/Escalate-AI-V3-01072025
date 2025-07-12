@@ -128,23 +128,56 @@ def init_db():
                   except Exception: pass
           conn.commit()
   
-  init_db()
-  ESC_COLS=[c[1] for c in sqlite3.connect(DB_PATH).execute("PRAGMA table_info(escalations)").fetchall()]
-  
-  def upsert_case(case:dict):
-      data={k:case.get(k) for k in ESC_COLS}
-      with sqlite3.connect(DB_PATH) as conn:
-          conn.execute(f"REPLACE INTO escalations ({','.join(data.keys())}) VALUES ({','.join('?'*len(data))})", tuple(data.values()))
-          conn.commit()
-  
-  def fetch_cases()->pd.DataFrame:
-      with sqlite3.connect(DB_PATH) as conn:
-          return pd.read_sql_query("SELECT * FROM escalations ORDER BY created_at DESC", conn)
-  
-  def fetch_logs()->pd.DataFrame:
-      with sqlite3.connect(DB_PATH) as conn:
-          return pd.read_sql_query("SELECT * FROM notification_log ORDER BY sent_at DESC", conn)
-  
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS escalations (
+            id TEXT PRIMARY KEY,
+            customer TEXT,
+            issue TEXT,
+            criticality TEXT,
+            impact TEXT,
+            sentiment TEXT,
+            urgency TEXT,
+            escalated INTEGER,
+            date_reported TEXT,
+            owner TEXT,
+            status TEXT,
+            action_taken TEXT,
+            risk_score REAL,
+            spoc_email TEXT,
+            spoc_boss_email TEXT,
+            spoc_notify_count INTEGER DEFAULT 0,
+            spoc_last_notified TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+
+        cur.execute("""CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            escalation_id TEXT,
+            recipient_email TEXT,
+            subject TEXT,
+            body TEXT,
+            sent_at TEXT)""")
+
+        conn.commit()
+
+        # Ensure upgraded cols
+        cur.execute("PRAGMA table_info(escalations)")
+        cols = [c[1] for c in cur.fetchall()]
+        need = {
+            "spoc_notify_count": "INTEGER DEFAULT 0",
+            "spoc_last_notified": "TEXT",
+            "spoc_email": "TEXT",
+            "spoc_boss_email": "TEXT"
+        }
+        for c, t in need.items():
+            if c not in cols:
+                try:
+                    cur.execute(f"ALTER TABLE escalations ADD COLUMN {c} {t}")
+                except Exception:
+                    pass
+        conn.commit()
+
   # ========== Email (retries) ==========
   
   def send_email(to_email:str, subject:str, body:str, esc_id:str, retries:int=3)->bool:
