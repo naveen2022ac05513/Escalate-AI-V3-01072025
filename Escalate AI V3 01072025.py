@@ -348,13 +348,13 @@ else:
     st.markdown("---")
     st.subheader("📥 Download Escalation Data")
 
-    def to_excel(df):
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Escalations')
-            writer.save()
-        processed_data = output.getvalue()
-        return processed_data
+def to_excel(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Escalations')
+    processed_data = output.getvalue()
+    return processed_data
+
 
     excel_data = to_excel(df)
     st.download_button(
