@@ -409,12 +409,13 @@ if df.empty:
 else:
     st.subheader("🗂️ Escalation Kanban Board")
 
-    # Summary counts on top
-    status_counts = df['status'].value_counts()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Open", status_counts.get("Open", 0))
-    col2.metric("In Progress", status_counts.get("In Progress", 0))
-    col3.metric("Resolved", status_counts.get("Resolved", 0))
+    # Summary counts
+    open_count = (df.status == "Open").sum()
+    inprogress_count = (df.status == "In Progress").sum()
+    resolved_count = (df.status == "Resolved").sum()
+    st.markdown(
+        f"**Summary:** Open: {open_count} | In Progress: {inprogress_count} | Resolved: {resolved_count}"
+    )
 
     cols = st.columns(3)
     for status, col in zip(["Open", "In Progress", "Resolved"], cols):
@@ -427,45 +428,46 @@ else:
                     st.markdown(f"**Owner:** {row['owner']}")
                     st.markdown(f"**Risk Score:** {row['risk_score']}")
 
-                    # Editable SPOC Email
-                    new_spoc_email = st.text_input(
-                        "SPOC Email", value=row.get("spoc_email", ""), key=f"spoc_email_{row['id']}"
-                    )
-                    # Editable SPOC Boss Email
-                    new_spoc_boss_email = st.text_input(
-                        "SPOC Boss Email", value=row.get("spoc_boss_email", ""), key=f"spoc_boss_email_{row['id']}"
-                    )
-
-                    # Status and Action Taken edits
                     new_status = st.selectbox(
                         "Update Status",
                         ["Open", "In Progress", "Resolved"],
                         index=["Open", "In Progress", "Resolved"].index(row["status"]),
-                        key=f"status_{row['id']}",
+                        key=f"status_{row['id']}"
                     )
                     new_action = st.text_input(
-                        "Action Taken", value=row["action_taken"], key=f"act_{row['id']}"
+                        "Action Taken",
+                        value=row["action_taken"],
+                        key=f"act_{row['id']}"
+                    )
+                    new_spoc_email = st.text_input(
+                        "SPOC Email",
+                        value=row.get("spoc_email", ""),
+                        key=f"spoc_{row['id']}"
+                    )
+                    new_spoc_boss_email = st.text_input(
+                        "SPOC Boss Email",
+                        value=row.get("spoc_boss_email", ""),
+                        key=f"boss_{row['id']}"
                     )
 
-                    # If any field changed, update DB and rerun
-                   if (new_status != row["status"] or
-    new_action != row["action_taken"] or
-    new_spoc_email != row.get("spoc_email", "") or
-    new_spoc_boss_email != row.get("spoc_boss_email", "")):
+                    if (
+                        new_status != row["status"] or
+                        new_action != row["action_taken"] or
+                        new_spoc_email != row.get("spoc_email", "") or
+                        new_spoc_boss_email != row.get("spoc_boss_email", "")
+                    ):
+                        updated_case = row.to_dict()
+                        updated_case["status"] = new_status
+                        updated_case["action_taken"] = new_action
+                        updated_case["spoc_email"] = new_spoc_email
+                        updated_case["spoc_boss_email"] = new_spoc_boss_email
 
-    updated_case = row.to_dict()
-    updated_case["status"] = new_status
-    updated_case["action_taken"] = new_action
-    updated_case["spoc_email"] = new_spoc_email
-    updated_case["spoc_boss_email"] = new_spoc_boss_email
+                        upsert_case(updated_case)
+                        st.session_state["needs_rerun"] = True
 
-    upsert_case(updated_case)
-    st.session_state["needs_rerun"] = True
-
-if st.session_state.get("needs_rerun", False):
-    st.session_state["needs_rerun"] = False
-    st.experimental_rerun()
-
+    if st.session_state.get("needs_rerun", False):
+        st.session_state["needs_rerun"] = False
+        st.experimental_rerun()
 
     st.download_button(
         "⬇️ Download as Excel",
@@ -473,5 +475,3 @@ if st.session_state.get("needs_rerun", False):
         file_name="escalations_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-st.success("✅ EscalateAI Core Loaded.")
