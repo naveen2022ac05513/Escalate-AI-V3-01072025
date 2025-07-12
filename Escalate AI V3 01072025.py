@@ -272,13 +272,20 @@ else:
                         key=f"act_{row['id']}"
                     )
 
-                    if st.button(f"Save changes for {row['id']}", key=f"save_{row['id']}"):
+                    save_key = f"save_{row['id']}"
+                    if st.button(f"Save changes for {row['id']}", key=save_key):
                         if new_status != row["status"] or new_action != row["action_taken"]:
                             row["status"] = new_status
                             row["action_taken"] = new_action
                             upsert_case(row.to_dict())
-                            st.experimental_rerun()
+                            # Instead of calling st.experimental_rerun() immediately,
+                            # set a flag in session state to rerun outside loop.
+                            st.session_state['need_rerun'] = True
 
+# After the whole Kanban board code:
+if st.session_state.get('need_rerun', False):
+    st.session_state['need_rerun'] = False
+    st.experimental_rerun()
 
     # Fix here: Excel download via BytesIO buffer
     output = io.BytesIO()
