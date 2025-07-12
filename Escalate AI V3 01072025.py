@@ -50,7 +50,7 @@ except ModuleNotFoundError:
 # We'll only attempt HF pipeline if BOTH are present
 _use_hf = _has_transformers and _has_torch
 
-@st.cache_resource(show_spinner=False)(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_sentiment_model():
     if not _has_transformers:
         st.sidebar.warning("Transformers not installed – using rule‑based sentiment.")
