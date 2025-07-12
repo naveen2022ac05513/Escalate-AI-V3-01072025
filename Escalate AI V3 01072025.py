@@ -448,19 +448,24 @@ else:
                     )
 
                     # If any field changed, update DB and rerun
-                    if (new_status != row["status"] or
-                        new_action != row["action_taken"] or
-                        new_spoc_email != row.get("spoc_email", "") or
-                        new_spoc_boss_email != row.get("spoc_boss_email", "")):
+                   if (new_status != row["status"] or
+    new_action != row["action_taken"] or
+    new_spoc_email != row.get("spoc_email", "") or
+    new_spoc_boss_email != row.get("spoc_boss_email", "")):
 
-                        updated_case = row.to_dict()
-                        updated_case["status"] = new_status
-                        updated_case["action_taken"] = new_action
-                        updated_case["spoc_email"] = new_spoc_email
-                        updated_case["spoc_boss_email"] = new_spoc_boss_email
+    updated_case = row.to_dict()
+    updated_case["status"] = new_status
+    updated_case["action_taken"] = new_action
+    updated_case["spoc_email"] = new_spoc_email
+    updated_case["spoc_boss_email"] = new_spoc_boss_email
 
-                        upsert_case(updated_case)
-                        st.experimental_rerun()
+    upsert_case(updated_case)
+    st.session_state["needs_rerun"] = True
+
+if st.session_state.get("needs_rerun", False):
+    st.session_state["needs_rerun"] = False
+    st.experimental_rerun()
+
 
     st.download_button(
         "⬇️ Download as Excel",
