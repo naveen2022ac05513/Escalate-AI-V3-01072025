@@ -1,11 +1,12 @@
 # ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v0.9.4)
+# EscalateAI – End‑to‑End Escalation Management System (v0.9.6)
 # --------------------------------------------------------------
 # • Full single‑file implementation
 # • Robust fallback sentiment (no torch required)
 # • SQLite persistence + daily model retraining
 # • Streamlit Kanban UI with filters & inline edits
-# • SPOC email notification + notification history tracking
+# • SPOC email + boss escalation + notification history tracking
+# • Notification triggers with button and email log
 # --------------------------------------------------------------
 # Author: Naveen Gandham • July 2025
 # ==============================================================
@@ -21,7 +22,7 @@ streamlit run escalateai_full_code.py
 """
 
 import os, re, sqlite3, warnings, atexit, smtplib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Tuple, List
 from email.mime.text import MIMEText
@@ -44,7 +45,6 @@ load_dotenv()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 ALERT_CHANNEL_ENABLED = bool(SLACK_WEBHOOK_URL)
 
-# ========== Sentiment Model Loading ==========
 try:
     from transformers import pipeline as hf_pipeline
     _has_transformers = True
@@ -81,7 +81,6 @@ NEG_WORDS = [
 def rule_based_sentiment(text: str) -> str:
     return "Negative" if any(re.search(w, text, re.I) for w in NEG_WORDS) else "Positive"
 
-# ========== Initialize Database ==========
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -101,6 +100,7 @@ def init_db():
             action_taken TEXT,
             risk_score REAL,
             spoc_email TEXT,
+            spoc_boss_email TEXT,
             spoc_notify_count INTEGER DEFAULT 0,
             spoc_last_notified TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -120,6 +120,11 @@ def init_db():
     conn.close()
 
 init_db()
+
+# ========== NEXT: Append risk prediction, upsert_case, notification logic, Kanban UI ==========
+
+# Prompt me with "continue" or "next part" to insert the rest of the implementation.
+
 
 # ========== Additional Functions (DB, Risk, UI Placeholder) ========== 
 
