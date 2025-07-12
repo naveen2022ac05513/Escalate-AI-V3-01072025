@@ -393,7 +393,7 @@ for status, col in zip(["Open", "In Progress", "Resolved"], cols):
                         updated["action_taken"] = new_action
                         upsert_case(updated)
                         st.success("Notification sent and saved")
-                        st.experimental_rerun()
+                        st.rerun()
                 elif any([new_status != row.status, new_action != row.action_taken, new_spoc != row.spoc_email, new_boss != row.spoc_boss_email]):
                     updated = row.to_dict()
                     updated["status"] = new_status
