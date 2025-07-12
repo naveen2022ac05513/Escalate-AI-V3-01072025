@@ -402,6 +402,31 @@ with st.sidebar:
                 notify_spoc(case)
             st.success(f"Escalation {case['id']} logged!")
 
+import smtplib
+from email.mime.text import MIMEText
+
+# Example: simple SMTP send email function
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    try:
+        smtp_server = "smtp.yourmail.com"
+        smtp_port = 587
+        smtp_user = "your-email@example.com"
+        smtp_pass = "your-email-password"
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = smtp_user
+        msg["To"] = to_email
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+        return True
+    except Exception as e:
+        st.error(f"Failed to send email: {e}")
+        return False
+
 # ---------- Kanban Board ----------
 df = fetch_cases()
 if df.empty:
@@ -461,9 +486,25 @@ else:
                         updated_case["action_taken"] = new_action
                         updated_case["spoc_email"] = new_spoc_email
                         updated_case["spoc_boss_email"] = new_spoc_boss_email
-
                         upsert_case(updated_case)
                         st.session_state["needs_rerun"] = True
+
+                    # Notify SPOC button
+                    if st.button(f"Notify SPOC ({row.get('spoc_email','No Email')})", key=f"notify_{row['id']}"):
+                        spoc_email = new_spoc_email or row.get("spoc_email")
+                        if spoc_email:
+                            subject = f"Escalation Notification: Case {row['id']}"
+                            body = f"Dear SPOC,\n\nPlease be informed about the escalation:\n\nIssue: {row['issue']}\nCustomer: {row['customer']}\nUrgency: {row['urgency']}\nStatus: {new_status}\n\nPlease take necessary action.\n\nRegards,\nEscalateAI"
+                            if send_email(spoc_email, subject, body):
+                                # Update notify count and last notified time
+                                updated_case = row.to_dict()
+                                updated_case["spoc_notify_count"] = (row.get("spoc_notify_count") or 0) + 1
+                                updated_case["spoc_last_notified"] = datetime.now().isoformat()
+                                upsert_case(updated_case)
+                                st.success(f"Notification sent to {spoc_email}")
+                                st.session_state["needs_rerun"] = True
+                        else:
+                            st.warning("Please enter a valid SPOC Email to notify.")
 
     if st.session_state.get("needs_rerun", False):
         st.session_state["needs_rerun"] = False
