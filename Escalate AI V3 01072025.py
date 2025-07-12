@@ -383,6 +383,8 @@ for status, col in zip(["Open", "In Progress", "Resolved"], cols):
                 if st.button("Notify SPOC", key=f"notify_{row.id}") and new_spoc:
                     subj = f"Escalation {row.id} Notification"
                     body = f"Dear SPOC,\n\nPlease attend to escalation {row.id}.\n\nIssue: {row.issue}"
+                    if send_email(new_spoc, subj, body, row.id):
+
                 if send_email(new_spoc, subj, body, row.id):
                     updated = row.to_dict()
                     updated["spoc_notify_count"] = (row.get("spoc_notify_count") or 0) + 1
