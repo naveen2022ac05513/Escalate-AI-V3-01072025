@@ -1,5 +1,5 @@
 # ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v1.1.1)
+# EscalateAI – End‑to‑End Escalation Management System (v1.1.2)
 # --------------------------------------------------------------
 # • Full single‑file Streamlit app
 # • SQLite persistence & auto‑schema upgrade
@@ -191,8 +191,14 @@ def boss_check():
                         upd=r.to_dict(); upd["spoc_notify_count"]+=1; upsert_case(upd)
     except Exception as e:
         st.warning(f"Scheduler error: {e}")
+
 if "sched" not in st.session_state:
-    sc=BackgroundScheduler(); sc.add
+    sc=BackgroundScheduler()
+    sc.add_job(boss_check, "interval", hours=1)
+    sc.start()
+    atexit.register(lambda: sc.shutdown(wait=False))
+    st.session_state["sched"] = True
+
 # ========== Sidebar Upload & Manual Entry ==========
 with st.sidebar:
     st.header("📥 Upload Escalations")
