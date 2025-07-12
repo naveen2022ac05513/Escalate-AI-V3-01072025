@@ -243,6 +243,7 @@ with st.sidebar:
                 send_slack_alert(case)
             st.success(f"Escalation {case['id']} logged!")
 
+# ---------- Kanban Board ----------
 df = fetch_cases()
 if df.empty:
     st.info("No escalations logged yet.")
@@ -258,6 +259,7 @@ else:
                     st.markdown(f"**Sentiment / Urgency:** {row['sentiment']} / {row['urgency']}")
                     st.markdown(f"**Owner:** {row['owner']}")
                     st.markdown(f"**Risk Score:** {row['risk_score']}")
+
                     new_status = st.selectbox(
                         "Update Status",
                         ["Open", "In Progress", "Resolved"],
@@ -269,11 +271,14 @@ else:
                         value=row["action_taken"],
                         key=f"act_{row['id']}"
                     )
-                    if new_status != row["status"] or new_action != row["action_taken"]:
-                        row["status"] = new_status
-                        row["action_taken"] = new_action
-                        upsert_case(row.to_dict())
-                        st.experimental_rerun()
+
+                    if st.button(f"Save changes for {row['id']}", key=f"save_{row['id']}"):
+                        if new_status != row["status"] or new_action != row["action_taken"]:
+                            row["status"] = new_status
+                            row["action_taken"] = new_action
+                            upsert_case(row.to_dict())
+                            st.experimental_rerun()
+
 
     # Fix here: Excel download via BytesIO buffer
     output = io.BytesIO()
