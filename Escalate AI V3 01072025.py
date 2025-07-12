@@ -361,3 +361,13 @@ else:
             file_name="escalations_export.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+# ======= Download Excel =========
+df_all = fetch_cases()
+if not df_all.empty:
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("📤 Download Escalation Report")
+        excel_bytes = df_all.to_excel(index=False, engine='openpyxl')
+        st.download_button("⬇️ Download Excel with Status", data=excel_bytes,
+                           file_name="Escalation_Status_Report.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
