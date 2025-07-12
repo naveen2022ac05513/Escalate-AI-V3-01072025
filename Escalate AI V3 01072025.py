@@ -195,7 +195,6 @@ def boss_check():
 if "sched" not in st.session_state:
     sc=BackgroundScheduler(); sc.add
 
-
 # ========== Sidebar Upload & Manual Entry ==========
 with st.sidebar:
     st.header("📥 Upload Escalations")
