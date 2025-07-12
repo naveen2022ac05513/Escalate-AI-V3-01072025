@@ -383,17 +383,17 @@ for status, col in zip(["Open", "In Progress", "Resolved"], cols):
                 if st.button("Notify SPOC", key=f"notify_{row.id}") and new_spoc:
                     subj = f"Escalation {row.id} Notification"
                     body = f"Dear SPOC,\n\nPlease attend to escalation {row.id}.\n\nIssue: {row.issue}"
-                    if send_email(new_spoc, subj, body, row.id):
-                        updated = row.to_dict()
-                        updated["spoc_notify_count"] = (row.get("spoc_notify_count") or 0) + 1
-                        updated["spoc_last_notified"] = datetime.now().isoformat()
-                        updated["spoc_email"] = new_spoc
-                        updated["spoc_boss_email"] = new_boss
-                        updated["status"] = new_status
-                        updated["action_taken"] = new_action
-                        upsert_case(updated)
-                        st.success("Notification sent and saved")
-                        st.rerun()
+                  if send_email(new_spoc, subj, body, row.id):
+    updated = row.to_dict()
+    updated["spoc_notify_count"] = (row.get("spoc_notify_count") or 0) + 1
+    updated["spoc_last_notified"] = datetime.now().isoformat()
+    updated["spoc_email"] = new_spoc
+    updated["spoc_boss_email"] = new_boss
+    updated["status"] = new_status
+    updated["action_taken"] = new_action
+    upsert_case(updated)
+    st.success("Notification sent and saved")
+    st.rerun()  # ✅ updated from experimental
                 elif any([new_status != row.status, new_action != row.action_taken, new_spoc != row.spoc_email, new_boss != row.spoc_boss_email]):
                     updated = row.to_dict()
                     updated["status"] = new_status
