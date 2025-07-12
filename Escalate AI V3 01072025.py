@@ -34,81 +34,23 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
-# transformers is optional – fallback rule‑based sentiment if missing
+# transformers & torch are optional – fallback rule‑based sentiment if either missing
 try:
     from transformers import pipeline as hf_pipeline
     _has_transformers = True
 except ModuleNotFoundError:
     _has_transformers = False
 
-# ----------------------------
-# ENV & GLOBAL CONSTANTS
-# ----------------------------
-APP_DIR  = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
-MODEL_DIR= APP_DIR / "models"
-DB_PATH  = DATA_DIR / "escalateai.db"
+try:
+    import torch  # noqa: F401 – just to check availability
+    _has_torch = True
+except ModuleNotFoundError:
+    _has_torch = False
 
-DATA_DIR.mkdir(exist_ok=True)
-MODEL_DIR.mkdir(exist_ok=True)
+# We'll only attempt HF pipeline if BOTH are present
+_use_hf = _has_transformers and _has_torch
 
-load_dotenv()
-SLACK_WEBHOOK_URL     = os.getenv("SLACK_WEBHOOK_URL", "")
-ALERT_CHANNEL_ENABLED = bool(SLACK_WEBHOOK_URL)
-
-# ----------------------------
-# DATABASE HELPERS (SQLite)
-# ----------------------------
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS escalations (
-                id TEXT PRIMARY KEY,
-                customer TEXT,
-                issue TEXT,
-                criticality TEXT,
-                impact TEXT,
-                sentiment TEXT,
-                urgency TEXT,
-                escalated INTEGER,
-                date_reported TEXT,
-                owner TEXT,
-                status TEXT,
-                action_taken TEXT,
-                risk_score REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-
-def upsert_case(case: dict):
-    cols = ", ".join(case.keys())
-    placeholders = ", ".join(["?"] * len(case))
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(f"REPLACE INTO escalations ({cols}) VALUES ({placeholders})", tuple(case.values()))
-
-
-def fetch_cases() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql("SELECT * FROM escalations", conn)
-
-
-def next_escalation_id() -> str:
-    with sqlite3.connect(DB_PATH) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM escalations").fetchone()[0]
-    return f"ESC-{10000 + count + 1}"
-
-# ----------------------------
-# NLP PIPELINE (Sentiment & Urgency)
-# ----------------------------
-NEG_URGENCY_KWS: List[str] = [
-    "urgent", "critical", "immediately", "asap", "business impact", "high priority"
-]
-
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)(show_spinner=False)
 def load_sentiment_model():
     if not _has_transformers:
         st.sidebar.warning("Transformers not installed – using rule‑based sentiment.")
