@@ -1,23 +1,26 @@
 # ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v1.1.2)
+# EscalateAI – End‑to‑End Escalation Management System (v1.2.0)
 # --------------------------------------------------------------
 # • Full single‑file Streamlit app
 # • SQLite persistence & auto‑schema upgrade
 # • Sentiment (HF or rule‑based) + risk ML model
+# • Outlook / Microsoft Graph email ingestion (O365 lib)
 # • Sidebar: Excel/CSV upload  & manual entry
 # • Kanban board with inline edits & notifications
 # • Notification History viewer
 # • Robust SMTP email with retries
-# • Scheduler escalates to boss after 2 SPOC emails & 24 h
+# • Scheduler: SPOC reminders + boss escalation + Outlook polling
 # --------------------------------------------------------------
 # Author: Naveen Gandham • July 2025
 # ==============================================================
 
 """Quick‑start:
 
-pip install streamlit pandas openpyxl python-dotenv transformers scikit-learn joblib requests apscheduler
+# Install dependencies
+pip install streamlit pandas openpyxl python-dotenv requests apscheduler \
+            scikit-learn joblib O365 xlsxwriter
 # (Optional) better accuracy – only if PyTorch wheel available:
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch --index-url https://download.pytorch.org/whl/cpu transformers
 
 # .env (same folder)
 SMTP_SERVER=smtp.mail.yahoo.com
@@ -26,49 +29,74 @@ SMTP_USER=naveengandham@yahoo.co.in
 SMTP_PASS=<YAHOO_APP_PASSWORD>
 SLACK_WEBHOOK_URL=
 
+# Microsoft Graph application credentials
+O365_CLIENT_ID=<AZURE_CLIENT_ID>
+O365_CLIENT_SECRET=<AZURE_CLIENT_SECRET>
+O365_TENANT_ID=<AZURE_TENANT_ID>
+O365_SENDER_FILTER= # optional – comma‑sep list of sender emails to ingest only
+O365_POLL_INTERVAL_MIN=5  # minutes between mailbox polls
+
 streamlit run escalateai_app.py
 """
 
-import os, re, sqlite3, atexit, smtplib, time
+# ========== Standard Library ==========
+import os, re, sqlite3, atexit, smtplib, time, io
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
-import joblib, pandas as pd, streamlit as st
-from apscheduler.schedulers.background import BackgroundScheduler
+# ========== Third‑party ==========
+import pandas as pd
+import streamlit as st
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
+import joblib
 
-# ========== Paths & ENV ==========
-APP_DIR   = Path(__file__).resolve().parent  # Directory of current file
-MODEL_DIR = APP_DIR / "models"                # Models directory
-DATA_DIR  = APP_DIR / "data"                  # Data directory
-DB_PATH   = DATA_DIR / "escalateai.db"       # SQLite database file path
-
-# Load environment variables from .env file
-load_dotenv()
-SMTP_SERVER = os.getenv("SMTP_SERVER")        # SMTP server host
-SMTP_PORT   = int(os.getenv("SMTP_PORT", 587))# SMTP port, default 587
-SMTP_USER   = os.getenv("SMTP_USER")          # SMTP login user
-SMTP_PASS   = os.getenv("SMTP_PASS")          # SMTP login password/app password
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")  # Optional Slack notifications
-
-# ========== Sentiment Analysis Setup ==========
-
-# Try to import HuggingFace transformers pipeline for sentiment analysis
+# Optional NLP (transformers)
 try:
-    from transformers import pipeline as hf_pipeline
-    import torch
+    from transformers import pipeline as hf_pipeline  # type: ignore
+    import torch  # noqa: F401 – imported for transformers CPU wheels
     HAS_NLP = True
 except Exception:
-    HAS_NLP = False  # If import fails, fallback to rule-based sentiment
+    HAS_NLP = False
 
+# Outlook – Microsoft Graph wrapper
+try:
+    from O365 import Account, MSGraphProtocol  # type: ignore
+    HAS_O365 = True
+except Exception:
+    HAS_O365 = False
+
+# ========== Paths & ENV ==========
+APP_DIR = Path(__file__).resolve().parent
+MODEL_DIR = APP_DIR / "models"
+DATA_DIR = APP_DIR / "data"
+DB_PATH = DATA_DIR / "escalateai.db"
+DATA_DIR.mkdir(exist_ok=True)
+MODEL_DIR.mkdir(exist_ok=True)
+
+load_dotenv()
+
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+
+# Outlook credentials & settings
+O365_CLIENT_ID = os.getenv("O365_CLIENT_ID")
+O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET")
+O365_TENANT_ID = os.getenv("O365_TENANT_ID")
+SENDER_FILTER = [s.strip().lower() for s in os.getenv("O365_SENDER_FILTER", "").split(",") if s.strip()]  # optional
+POLL_INTERVAL_MIN = int(os.getenv("O365_POLL_INTERVAL_MIN", 10))  # mailbox polling interval
+
+# ========== Sentiment Analysis Setup ==========
 @st.cache_resource(show_spinner=False)
 def load_sentiment():
-    # Load HuggingFace sentiment analysis pipeline with CardiffNLP model if available
     if not HAS_NLP:
         return None
     try:
@@ -76,228 +104,261 @@ def load_sentiment():
     except Exception:
         return None
 
-# Load sentiment analysis model once (cached)
 sent_model = load_sentiment()
 
-# List of regex patterns for common negative sentiment words
-negative_words = [
+NEG_WORDS = [
     r"\b(problematic|delay|issue|failure|dissatisfaction|frustration|unacceptable|mistake|complaint|unresolved|unresponsive|unstable|broken|defective|overdue|escalation|leakage|damage|burnt|critical|risk|dispute|faulty)\b"
 ]
-NEG_WORDS = negative_words
 
 def rule_sent(text: str) -> str:
-    # Rule-based sentiment detection by checking for negative words
-    return "Negative" if any(re.search(w, text, re.I) for w in NEG_WORDS) else "Positive"
+    return "Negative" if any(re.search(p, text, re.I) for p in NEG_WORDS) else "Positive"
 
 def analyze_issue(text: str) -> Tuple[str, str, bool]:
-    """
-    Analyze issue text to determine sentiment, urgency, and whether it's escalated
-    Returns:
-      sentiment: "Positive" or "Negative"
-      urgency: "High" or "Low"
-      escalated: True if sentiment is Negative and urgency is High, else False
-    """
     if sent_model:
-        # Use HF model for sentiment
         label = sent_model(text[:512])[0]["label"].lower()
         sentiment = "Negative" if label == "negative" else "Positive"
     else:
-        # Fallback to rule-based
         sentiment = rule_sent(text)
-    urgency = "High" if any(k in text.lower() for k in ["urgent", "immediate", "critical"]) else "Low"
+    urgency = "High" if any(k in text.lower() for k in ["urgent", "immediate", "critical", "asap"]) else "Low"
     return sentiment, urgency, sentiment == "Negative" and urgency == "High"
 
 # ========== Database Initialization & Helpers ==========
 
 def init_db():
-    """
-    Initialize SQLite DB:
-    - Create escalations table with schema for escalation tracking and notification fields
-    - Create notification_log table to store sent emails history
-    - Add missing columns on upgrades gracefully
-    """
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        # Create escalations table if missing
-        cur.execute("""CREATE TABLE IF NOT EXISTS escalations (
-            id TEXT PRIMARY KEY,
-            customer TEXT,
-            issue TEXT,
-            criticality TEXT,
-            impact TEXT,
-            sentiment TEXT,
-            urgency TEXT,
-            escalated INTEGER,
-            date_reported TEXT,
-            owner TEXT,
-            status TEXT,
-            action_taken TEXT,
-            risk_score REAL,
-            spoc_email TEXT,
-            spoc_boss_email TEXT,
-            spoc_notify_count INTEGER DEFAULT 0,
-            spoc_last_notified TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
-
-        # Create notification log table for audit trail
-        cur.execute("""CREATE TABLE IF NOT EXISTS notification_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            escalation_id TEXT,
-            recipient_email TEXT,
-            subject TEXT,
-            body TEXT,
-            sent_at TEXT)""")
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS escalations (
+                id TEXT PRIMARY KEY,
+                customer TEXT,
+                issue TEXT,
+                criticality TEXT,
+                impact TEXT,
+                sentiment TEXT,
+                urgency TEXT,
+                escalated INTEGER,
+                date_reported TEXT,
+                owner TEXT,
+                status TEXT,
+                action_taken TEXT,
+                risk_score REAL,
+                spoc_email TEXT,
+                spoc_boss_email TEXT,
+                spoc_notify_count INTEGER DEFAULT 0,
+                spoc_last_notified TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        cur.execute(
+            """CREATE TABLE IF NOT EXISTS notification_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                escalation_id TEXT,
+                recipient_email TEXT,
+                subject TEXT,
+                body TEXT,
+                sent_at TEXT
+            )"""
+        )
         conn.commit()
 
-        # Upgrade schema: add missing columns if not present (safe to call multiple times)
+        # Auto‑add any new columns (future‑proof)
         cur.execute("PRAGMA table_info(escalations)")
         cols = [c[1] for c in cur.fetchall()]
         need = {
             "spoc_notify_count": "INTEGER DEFAULT 0",
             "spoc_last_notified": "TEXT",
-            "spoc_email": "TEXT",
-            "spoc_boss_email": "TEXT"
+            "owner": "TEXT",
         }
         for c, t in need.items():
             if c not in cols:
                 try:
                     cur.execute(f"ALTER TABLE escalations ADD COLUMN {c} {t}")
                 except Exception:
-                    pass  # Ignore if cannot alter table (e.g. older SQLite version)
+                    pass
         conn.commit()
 
-# Initialize DB at app start
 init_db()
 
-# Cached list of escalation table columns for upsert convenience
 ESC_COLS = [c[1] for c in sqlite3.connect(DB_PATH).execute("PRAGMA table_info(escalations)").fetchall()]
 
 def upsert_case(case: dict):
-    """
-    Insert or update an escalation record by REPLACE INTO primary key 'id'
-    """
     data = {k: case.get(k) for k in ESC_COLS}
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(f"REPLACE INTO escalations ({','.join(data.keys())}) VALUES ({','.join('?'*len(data))})",
-                     tuple(data.values()))
+        conn.execute(
+            f"REPLACE INTO escalations ({','.join(data.keys())}) VALUES ({','.join('?'*len(data))})",
+            tuple(data.values()),
+        )
         conn.commit()
 
 def fetch_cases() -> pd.DataFrame:
-    """
-    Load all escalation cases ordered by creation time descending
-    """
     with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql_query("SELECT * FROM escalations ORDER BY created_at DESC", conn)
+        return pd.read_sql_query("SELECT * FROM escalations ORDER BY datetime(created_at) DESC", conn)
 
 def fetch_logs() -> pd.DataFrame:
-    """
-    Load all sent notification logs ordered by sent time descending
-    """
     with sqlite3.connect(DB_PATH) as conn:
-        return pd.read_sql_query("SELECT * FROM notification_log ORDER BY sent_at DESC", conn)
+        return pd.read_sql_query("SELECT * FROM notification_log ORDER BY datetime(sent_at) DESC", conn)
 
 # ========== Email Sending with Retries ==========
 
 def send_email(to_email: str, subject: str, body: str, esc_id: str, retries: int = 3) -> bool:
-    """
-    Send email via SMTP with retry mechanism.
-    Logs email to notification_log on success.
-    Returns True if sent successfully, else False.
-    """
     if not (SMTP_SERVER and SMTP_USER and SMTP_PASS):
-        st.error("SMTP not configured")
+        st.error("SMTP not configured properly")
         return False
     attempt = 0
     while attempt < retries:
         try:
             msg = MIMEText(body)
             msg["Subject"] = subject
-            msg["From"] = f"Escalation Notification - SE Services <{SMTP_USER}>"
+            msg["From"] = f"EscalateAI <{SMTP_USER}>"
             msg["To"] = to_email
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as s:
                 s.starttls()
                 s.login(SMTP_USER, SMTP_PASS)
                 s.send_message(msg)
-            # Log successful send in DB
+            # Log
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "INSERT INTO notification_log (escalation_id, recipient_email, subject, body, sent_at) VALUES (?, ?, ?, ?, ?)",
-                    (esc_id, to_email, subject, body, datetime.now().isoformat()))
+                    "INSERT INTO notification_log (escalation_id, recipient_email, subject, body, sent_at) VALUES (?,?,?,?,?)",
+                    (esc_id, to_email, subject, body, datetime.utcnow().isoformat()),
+                )
                 conn.commit()
             return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             attempt += 1
-            time.sleep(2)  # small delay before retry
+            time.sleep(2)
             if attempt == retries:
                 st.error(f"Email failed: {e}")
                 return False
 
 # ========== ML Risk Prediction Model ==========
-
 MODEL_FILE = MODEL_DIR / "risk_model.joblib"
 
 @st.cache_resource(show_spinner=False)
 def load_model():
-    """
-    Load pre-trained logistic regression risk model from disk if available
-    """
     return joblib.load(MODEL_FILE) if MODEL_FILE.exists() else None
 
 risk_model = load_model()
 
 def predict_risk(issue: str) -> float:
-    """
-    Predict risk score [0.0 - 1.0] for given issue text using the ML model
-    """
     return float(risk_model.predict_proba([issue])[0][1]) if risk_model else 0.0
 
-# ========== Scheduler to Escalate to Boss Email ==========
+# ========== Outlook / Microsoft Graph Email Ingestion ==========
+if HAS_O365 and O365_CLIENT_ID and O365_CLIENT_SECRET and O365_TENANT_ID:
+    credentials = (O365_CLIENT_ID, O365_CLIENT_SECRET)
+    protocol = MSGraphProtocol(default_resource="me")
+    account = Account(credentials, auth_flow_type="credentials", tenant_id=O365_TENANT_ID, protocol=protocol)
+    if not account.is_authenticated:
+        account.authenticate(scopes=["https://graph.microsoft.com/.default"])
+    mailbox = account.mailbox()
+    inbox_folder = mailbox.inbox_folder()
+else:
+    account = None
 
-def boss_check():
-    """
-    Background job to:
-    - Scan escalations
-    - If SPOC has been notified >=2 times and no response for 24h
-    - Send escalation email to SPOC's boss
-    - Update notification count
-    """
+
+def fetch_unread_emails() -> List[dict]:
+    """Return list of unread email metadata dicts."""
+    if not account:
+        return []
+    messages = inbox_folder.get_messages(limit=50, query="isRead eq false")
+    res: List[dict] = []
+    for msg in messages:
+        try:
+            sender = msg.sender.address.lower() if msg.sender else "unknown"
+            if SENDER_FILTER and sender not in SENDER_FILTER:
+                continue  # skip unwanted senders
+            res.append({
+                "id": msg.message_id,
+                "sender": sender,
+                "subject": msg.subject or "",
+                "body_preview": msg.body_preview or msg.subject or "",
+                "body": msg.body or msg.body_preview or msg.subject or "",
+                "received": msg.received,
+            })
+            msg.mark_as_read()
+        except Exception:
+            continue
+    return res
+
+
+def process_emails_to_cases():
+    new_cnt = 0
+    for em in fetch_unread_emails():
+        sentiment, urgency, esc = analyze_issue(em["body"])
+        case = {
+            "id": em["id"],  # Graph message_id is globally unique
+            "customer": em["sender"],
+            "issue": em["body"][:2000],  # truncate long bodies
+            "criticality": "Medium",
+            "impact": "Medium",
+            "sentiment": sentiment,
+            "urgency": urgency,
+            "escalated": int(esc),
+            "date_reported": em["received"].strftime("%Y-%m-%d"),
+            "owner": "Unassigned",
+            "status": "Open",
+            "action_taken": "",
+            "risk_score": predict_risk(em["body"]),
+            "spoc_email": "",
+            "spoc_boss_email": "",
+        }
+        upsert_case(case)
+        new_cnt += 1
+    if new_cnt:
+        st.toast(f"📧 {new_cnt} new escalation(s) ingested from Outlook", icon="✉️")
+
+# ========== Scheduler Jobs ==========
+
+def boss_escalation_job():
     try:
         df = fetch_cases()
+        now = datetime.utcnow()
         for _, r in df.iterrows():
-            if r.get("spoc_notify_count", 0) >= 2 and r.get("spoc_boss_email") and r.get("spoc_last_notified"):
-                last_notified = datetime.fromisoformat(r["spoc_last_notified"])
-                if datetime.now() - last_notified > timedelta(hours=24):
+            count = r.get("spoc_notify_count", 0) or 0
+            last = r.get("spoc_last_notified")
+            boss = r.get("spoc_boss_email")
+            if count >= 2 and boss and last:
+                last_dt = datetime.fromisoformat(last)
+                if now - last_dt > timedelta(hours=24):
                     subj = f"⚠️ Escalation {r['id']} unattended"
-                    body = f"Dear Manager,\n\nEscalation {r['id']} requires your attention."
-                    if send_email(r["spoc_boss_email"], subj, body, r["id"]):
+                    body = f"Dear Manager,\n\nEscalation {r['id']} has received no response for 24 hours after two notifications.\n\nIssue excerpt:\n{r['issue'][:400]}..."
+                    if send_email(boss, subj, body, r["id"]):
                         upd = r.to_dict()
-                        upd["spoc_notify_count"] += 1
+                        upd["spoc_notify_count"] = count + 1
                         upsert_case(upd)
     except Exception as e:
-        # Warn in Streamlit if scheduler fails (rare)
-        st.warning(f"Scheduler error: {e}")
+        st.warning(f"Boss escalation job error: {e}")
 
-# Initialize scheduler to run boss_check every hour (only once per session)
-if "sched" not in st.session_state:
-    sc = BackgroundScheduler()
-    sc.add_job(boss_check, "interval", hours=1)
-    sc.start()
-    atexit.register(lambda: sc.shutdown(wait=False))  # shutdown scheduler on exit
-    st.session_state["sched"] = True
 
-import io
+def outlook_poll_job():
+    try:
+        process_emails_to_cases()
+    except Exception as e:
+        st.warning(f"Outlook poll error: {e}")
 
-def to_excel(df):
+# START scheduler once (per Streamlit session)
+if "sched_main" not in st.session_state:
+    sched = BackgroundScheduler()
+    sched.add_job(boss_escalation_job, "interval", hours=1)
+    if account:
+        sched.add_job(outlook_poll_job, "interval", minutes=POLL_INTERVAL_MIN)
+    sched.start()
+    atexit.register(lambda: sched.shutdown(wait=False))
+    st.session_state["sched_main"] = True
+
+# ========== Utility ==========
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, sheet_name='Escalations', index=False)
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Escalations")
     return output.getvalue()
 
 # ========== Streamlit UI ==========
-import streamlit as st
+
 st.set_page_config(page_title="EscalateAI", layout="wide")
 st.title("🚨 EscalateAI – Escalation Tracking System")
 
+# Sidebar upload & manual entry
 with st.sidebar:
     st.header("📥 Upload Escalations")
     upl = st.file_uploader("Excel / CSV", type=["xlsx", "csv"])
@@ -306,7 +367,7 @@ with st.sidebar:
         for _, row in df_u.iterrows():
             sentiment, urgency, esc = analyze_issue(str(row.get("issue", "")))
             case = {
-                "id": row.get("id", f"ESC{int(datetime.utcnow().timestamp())}"),
+                "id": row.get("id", f"ESC{int(datetime.utcnow().timestamp()*1000)}"),
                 "customer": row.get("customer", "Unknown"),
                 "issue": row.get("issue", ""),
                 "criticality": row.get("criticality", "Medium"),
@@ -314,7 +375,7 @@ with st.sidebar:
                 "sentiment": sentiment,
                 "urgency": urgency,
                 "escalated": int(esc),
-                "date_reported": row.get("date_reported", datetime.today().date()),
+                "date_reported": str(row.get("date_reported", datetime.today().date())),
                 "owner": row.get("owner", "Unassigned"),
                 "status": row.get("status", "Open"),
                 "action_taken": row.get("action_taken", ""),
@@ -337,7 +398,7 @@ with st.sidebar:
         if st.form_submit_button("Log Escalation"):
             sentiment, urgency, esc = analyze_issue(issue)
             case = {
-                "id": f"ESC{int(datetime.utcnow().timestamp())}",
+                "id": f"ESC{int(datetime.utcnow().timestamp()*1000)}",
                 "customer": cname,
                 "issue": issue,
                 "criticality": crit,
@@ -356,56 +417,88 @@ with st.sidebar:
             upsert_case(case)
             st.success(f"Escalation {case['id']} logged")
 
-# ========== Kanban + Filter ==========
+# Main Kanban & Filters
+
 df = fetch_cases()
 show_filter = st.radio("📌 Show", ["All", "Only Escalated"], horizontal=True)
 if show_filter == "Only Escalated":
     df = df[df.escalated == 1]
 
 status_summary = df.status.value_counts().to_dict()
-st.markdown(f"### 🔢 Summary: Open: {status_summary.get('Open',0)}, In Progress: {status_summary.get('In Progress',0)}, Resolved: {status_summary.get('Resolved',0)}")
+st.markdown(
+    f"### 🔢 Summary: "
+    f"Open: {status_summary.get('Open',0)}, "
+    f"In Progress: {status_summary.get('In Progress',0)}, "
+    f"Resolved: {status_summary.get('Resolved',0)}"
+)
 
 cols = st.columns(3)
 for status, col in zip(["Open", "In Progress", "Resolved"], cols):
+    subset = df[df.status == status]
     with col:
         st.markdown(f"### {status}")
-        for _, row in df[df.status == status].iterrows():
+        if subset.empty:
+            st.caption("— No cases —")
+        for _, row in subset.iterrows():
             icon = "🔺" if row.escalated else ""
-            with st.expander(f"{icon} {row['id']} – {row['issue'][:50]}..."):
+            with st.expander(f"{icon} {row['id']} – {row['issue'][:50]}…"):
                 st.markdown(f"**Customer:** {row['customer']}")
                 st.markdown(f"**Sentiment / Urgency:** {row['sentiment']} / {row['urgency']}")
                 st.markdown(f"**Owner:** {row['owner']}")
                 st.markdown(f"**Risk Score:** {row['risk_score']:.2f}")
-                new_status = st.selectbox("Status", ["Open", "In Progress", "Resolved"], index=["Open", "In Progress", "Resolved"].index(row.status), key=f"st_{row.id}")
-                new_action = st.text_area("Action Taken", value=row.action_taken, key=f"act_{row.id}")
+
+                new_status = st.selectbox(
+                    "Status",
+                    ["Open", "In Progress", "Resolved"],
+                    index=["Open", "In Progress", "Resolved"].index(row.status),
+                    key=f"st_{row.id}",
+                )
+                new_action = st.text_area("Action Taken", value=row.action_taken or "", key=f"act_{row.id}")
                 new_spoc = st.text_input("SPOC Email", value=row.spoc_email or "", key=f"spoc_{row.id}")
                 new_boss = st.text_input("Boss Email", value=row.spoc_boss_email or "", key=f"boss_{row.id}")
+
                 if st.button("Notify SPOC", key=f"notify_{row.id}") and new_spoc:
                     subj = f"Escalation {row.id} Notification"
-                    body = f"Dear SPOC,\n\nPlease attend to escalation {row.id}.\n\nIssue: {row.issue}"
+                    body = (
+                        f"Dear SPOC,\n\nPlease attend to escalation {row.id}.\n\nIssue (excerpt):\n{row.issue[:400]}…"
+                    )
                     if send_email(new_spoc, subj, body, row.id):
                         updated = row.to_dict()
                         updated["spoc_notify_count"] = (row.get("spoc_notify_count") or 0) + 1
-                        updated["spoc_last_notified"] = datetime.now().isoformat()
+                        updated["spoc_last_notified"] = datetime.utcnow().isoformat()
                         updated["spoc_email"] = new_spoc
                         updated["spoc_boss_email"] = new_boss
                         updated["status"] = new_status
                         updated["action_taken"] = new_action
                         upsert_case(updated)
-                        st.success("Notification sent and saved")
-                        st.session_state["rerun"] = True  # set a flag to rerun
-
-                elif any([new_status != row.status, new_action != row.action_taken, new_spoc != row.spoc_email, new_boss != row.spoc_boss_email]):
+                        st.success("Notification sent & saved")
+                        st.experimental_rerun()
+                elif any([
+                    new_status != row.status,
+                    new_action != row.action_taken,
+                    new_spoc != row.spoc_email,
+                    new_boss != row.spoc_boss_email,
+                ]):
                     updated = row.to_dict()
-                    updated["status"] = new_status
-                    updated["action_taken"] = new_action
-                    updated["spoc_email"] = new_spoc
-                    updated["spoc_boss_email"] = new_boss
+                    updated.update({
+                        "status": new_status,
+                        "action_taken": new_action,
+                        "spoc_email": new_spoc,
+                        "spoc_boss_email": new_boss,
+                    })
                     upsert_case(updated)
                     st.success("Changes saved")
 
-# ========== Download Button ==========
+# Logs & Export
 st.subheader("⬇️ Download Escalation Data")
-excel_data = to_excel(fetch_cases())
-st.download_button("Download All as Excel", data=excel_data, file_name="escalations_export.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+excel_data = df_to_excel_bytes(fetch_cases())
+st.download_button(
+    "Download All as Excel",
+    data=excel_data,
+    file_name="escalations_export.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
+with st.expander("📜 Notification History"):
+    logs_df = fetch_logs()
+    st.dataframe(logs_df, use_container_width=True)
