@@ -1,98 +1,41 @@
-# ==============================================================
-# EscalateAI – End‑to‑End Escalation Management System (v1.2.0)
-# --------------------------------------------------------------
-# • Full single‑file Streamlit app
-# • SQLite persistence & auto‑schema upgrade
-# • Sentiment (HF or rule‑based) + risk ML model
-# • Outlook / Microsoft Graph email ingestion (O365 lib)
-# • Sidebar: Excel/CSV upload  & manual entry
-# • Kanban board with inline edits & notifications
-# • Notification History viewer
-# • Robust SMTP email with retries
-# • Scheduler: SPOC reminders + boss escalation + Outlook polling
-# --------------------------------------------------------------
-# Author: Naveen Gandham • July 2025
-# ==============================================================
+# ========== EscalateAI – Escalation Management with Outlook Integration ==========
+# Author: Naveen Gandham | Version: 1.2.0 | July 2025
+# Description: Adds full support for Outlook inbox/outbox parsing with sentiment detection,
+# automatic tagging, and escalation notification logic. Scheduled hourly polling.
 
-"""Quick‑start:
-
-# Install dependencies
-pip install streamlit pandas openpyxl python-dotenv requests apscheduler \
-            scikit-learn joblib O365 xlsxwriter
-# (Optional) better accuracy – only if PyTorch wheel available:
-pip install torch --index-url https://download.pytorch.org/whl/cpu transformers
-
-# .env (same folder)
-SMTP_SERVER=smtp.mail.yahoo.com
-SMTP_PORT=587
-SMTP_USER=naveengandham@yahoo.co.in
-SMTP_PASS=<YAHOO_APP_PASSWORD>
-SLACK_WEBHOOK_URL=
-
-# Microsoft Graph application credentials
-O365_CLIENT_ID=<AZURE_CLIENT_ID>
-O365_CLIENT_SECRET=<AZURE_CLIENT_SECRET>
-O365_TENANT_ID=<AZURE_TENANT_ID>
-O365_SENDER_FILTER= # optional – comma‑sep list of sender emails to ingest only
-O365_POLL_INTERVAL_MIN=5  # minutes between mailbox polls
-
-streamlit run escalateai_app.py
-"""
-
-# ========== Standard Library ==========
-import os, re, sqlite3, atexit, smtplib, time, io
+import os, re, sqlite3, atexit, smtplib, time
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple
 
-# ========== Third‑party ==========
-import pandas as pd
-import streamlit as st
-from dotenv import load_dotenv
+import joblib, pandas as pd, streamlit as st
 from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-import joblib
 
-# Optional NLP (transformers)
-try:
-    from transformers import pipeline as hf_pipeline  # type: ignore
-    import torch  # noqa: F401 – imported for transformers CPU wheels
-    HAS_NLP = True
-except Exception:
-    HAS_NLP = False
-
-# Outlook – Microsoft Graph wrapper
-try:
-    from O365 import Account, MSGraphProtocol  # type: ignore
-    HAS_O365 = True
-except Exception:
-    HAS_O365 = False
+# Outlook dependencies
+from O365 import Account, FileSystemTokenBackend
 
 # ========== Paths & ENV ==========
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR   = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
-DATA_DIR = APP_DIR / "data"
-DB_PATH = DATA_DIR / "escalateai.db"
-DATA_DIR.mkdir(exist_ok=True)
-MODEL_DIR.mkdir(exist_ok=True)
+DATA_DIR  = APP_DIR / "data"
+DB_PATH   = DATA_DIR / "escalateai.db"
+TOKEN_DIR = DATA_DIR / "o365_tokens"
+TOKEN_DIR.mkdir(exist_ok=True)
 
 load_dotenv()
-
 SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-
-# Outlook credentials & settings
-O365_CLIENT_ID = os.getenv("O365_CLIENT_ID")
-O365_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET")
-O365_TENANT_ID = os.getenv("O365_TENANT_ID")
-SENDER_FILTER = [s.strip().lower() for s in os.getenv("O365_SENDER_FILTER", "").split(",") if s.strip()]  # optional
-POLL_INTERVAL_MIN = int(os.getenv("O365_POLL_INTERVAL_MIN", 10))  # mailbox polling interval
+SMTP_PORT   = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER   = os.getenv("SMTP_USER")
+SMTP_PASS   = os.getenv("SMTP_PASS")
+OUTLOOK_CLIENT_ID = os.getenv("O365_CLIENT_ID")
+OUTLOOK_CLIENT_SECRET = os.getenv("O365_CLIENT_SECRET")
+TENANT_ID = os.getenv("O365_TENANT_ID")
+POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", 60))
 
 # ========== Sentiment Analysis Setup ==========
 @st.cache_resource(show_spinner=False)
@@ -121,6 +64,12 @@ def analyze_issue(text: str) -> Tuple[str, str, bool]:
         sentiment = rule_sent(text)
     urgency = "High" if any(k in text.lower() for k in ["urgent", "immediate", "critical", "asap"]) else "Low"
     return sentiment, urgency, sentiment == "Negative" and urgency == "High"
+
+# ========== Outlook Account Setup ==========
+credentials = (OUTLOOK_CLIENT_ID, OUTLOOK_CLIENT_SECRET)
+token_backend = FileSystemTokenBackend(token_path=TOKEN_DIR, token_filename='o365_token.txt')
+account = Account(credentials, auth_flow_type='credentials', tenant_id=TENANT_ID, token_backend=token_backend)
+account.authenticate()
 
 # ========== Database Initialization & Helpers ==========
 
@@ -197,6 +146,81 @@ def fetch_cases() -> pd.DataFrame:
 def fetch_logs() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
         return pd.read_sql_query("SELECT * FROM notification_log ORDER BY datetime(sent_at) DESC", conn)
+
+# ========== Outlook Email Parsing ==========
+def parse_outlook_emails():
+    mailbox = account.mailbox()
+    folder = mailbox.inbox_folder()
+    q = folder.new_query().on_attribute("is_read").equals(False)
+    messages = folder.get_messages(limit=30, query=q, download_attachments=False)
+    for msg in messages:
+        try:
+            subj = msg.subject or "(No Subject)"
+            body = msg.body or ""
+            sender = msg.sender.address
+            if not body.strip():
+                continue
+            sentiment, urgency, escalate = analyze_issue(body)
+            if sentiment == "Negative":
+                esc_id = f"AUTOESC{int(datetime.utcnow().timestamp())}"
+                case = {
+                    "id": esc_id,
+                    "customer": sender,
+                    "issue": subj + "\n" + body[:500],
+                    "criticality": "High",
+                    "impact": "High",
+                    "sentiment": sentiment,
+                    "urgency": urgency,
+                    "escalated": int(escalate),
+                    "date_reported": str(datetime.today().date()),
+                    "owner": "Unassigned",
+                    "status": "Open",
+                    "action_taken": "",
+                    "risk_score": predict_risk(body),
+                    "spoc_email": sender,
+                    "spoc_boss_email": "",  # You can update via directory or config
+                }
+                upsert_case(case)
+                msg.mark_as_read()
+        except Exception as e:
+            print("[Outlook Poll Error]", e)
+
+# ========== Notification Logic ==========
+def notify_and_escalate():
+    df = fetch_cases()
+    for _, r in df.iterrows():
+        try:
+            if r.status != "Open":
+                continue
+            hours_since = (datetime.now() - datetime.fromisoformat(r.date_reported)).total_seconds() / 3600
+            if r.spoc_notify_count < 2 and hours_since >= (r.spoc_notify_count + 1) * 6:
+                subj = f"Escalation {r.id} Requires Your Attention"
+                body = f"Dear SPOC,\n\nPlease review the issue:\n{r.issue[:300]}..."
+                if send_email(r.spoc_email, subj, body, r.id):
+                    r.spoc_notify_count += 1
+                    r.spoc_last_notified = datetime.now().isoformat()
+                    upsert_case(r.to_dict())
+            elif r.spoc_notify_count >= 2 and hours_since >= 24 and not r.escalated:
+                boss = r.spoc_boss_email
+                if boss:
+                    subj = f"⚠️ Escalation {r.id} Not Addressed in 24h"
+                    body = f"Manager,\n\nEscalation {r.id} from {r.customer} remains unaddressed.\nPlease take action."
+                    if send_email(boss, subj, body, r.id):
+                        r.spoc_notify_count += 1
+                        r.spoc_last_notified = datetime.now().isoformat()
+                        r.escalated = 1
+                        upsert_case(r.to_dict())
+        except Exception as e:
+            print("[Notify Error]", e)
+
+# ========== Scheduler ==========
+if "scheduler" not in st.session_state:
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(parse_outlook_emails, "interval", minutes=POLL_INTERVAL_MINUTES)
+    scheduler.add_job(notify_and_escalate, "interval", hours=1)
+    scheduler.start()
+    atexit.register(scheduler.shutdown)
+    st.session_state.scheduler = True
 
 # ========== Email Sending with Retries ==========
 
